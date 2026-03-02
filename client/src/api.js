@@ -1,4 +1,6 @@
-const API = '/api';
+const API = import.meta.env.DEV
+  ? '/api'
+  : 'https://talkgrid-messaging-web.onrender.com/api';
 
 function getToken() {
   return localStorage.getItem('chat_token');

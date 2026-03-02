@@ -10,7 +10,9 @@ export function connectSocket(token) {
   if (socket?.connected) return socket;
   if (socket) socket.disconnect();
   const isDev = import.meta.env.DEV;
-  const url = isDev ? 'http://localhost:3001' : window.location.origin;
+  const url = isDev
+    ? 'http://localhost:3001'
+    : 'https://talkgrid-messaging-web.onrender.com';
   socket = io(url, {
     path: '/socket.io',
     auth: { token },
