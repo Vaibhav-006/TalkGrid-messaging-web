@@ -6,20 +6,24 @@ const cors = require('cors');
 const db = require('./db');
 const { connectMongo } = require('./mongo');
 const { verifyToken } = require('./auth');
+const registerVoiceHandlers = require('./voiceSignaling');
 
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  // Allow frontend from local dev and deployed clients (e.g. Vercel)
   cors: {
-    origin: [
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://127.0.0.1:5173',
-      'http://127.0.0.1:5174',
-      /\.vercel\.app$/,
-    ],
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true);
+      try {
+        const host = new URL(origin).hostname;
+        if (host === 'localhost' || host === '127.0.0.1') return cb(null, true);
+        if (/\.(vercel\.app|onrender\.com)$/i.test(host)) return cb(null, true);
+      } catch {
+        return cb(null, false);
+      }
+      cb(null, false);
+    },
     methods: ['GET', 'POST'],
   },
 });
@@ -49,6 +53,7 @@ io.use((socket, next) => {
 
 io.on('connection', (socket) => {
   socket.join('user:' + String(socket.userId));
+  registerVoiceHandlers(socket, io, db);
 
   socket.on('message:send', ({ conversationId, content }) => {
     if (!content?.trim()) return;

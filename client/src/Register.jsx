@@ -23,7 +23,7 @@ export default function Register({ onRegister, onSwitch, error, setError }) {
       <p className="sub">Username must be unique. Sign up to start chatting.</p>
       {error && <div className="auth-error">{error}</div>}
       <form onSubmit={handleSubmit}>
-        <label htmlFor="username">Username</label>
+        <label htmlFor="username">Username</label>96
         <input
           id="username"
           type="text"

@@ -1,6 +1,19 @@
-const API = import.meta.env.DEV
-  ? '/api'
-  : 'https://talkgrid-messaging-web.onrender.com/api';
+const DEFAULT_PROD_API = 'https://talkgrid-messaging-web.onrender.com/api';
+
+function resolveApiBase() {
+  const fromEnv = import.meta.env.VITE_API_URL?.trim();
+  if (fromEnv) return fromEnv.replace(/\/+$/, '');
+  if (import.meta.env.DEV) return '/api';
+  if (typeof window !== 'undefined') {
+    const h = window.location.hostname;
+    if (h === 'localhost' || h === '127.0.0.1') {
+      return 'http://localhost:3001/api';
+    }
+  }
+  return DEFAULT_PROD_API;
+}
+
+const API = resolveApiBase();
 
 function getToken() {
   return localStorage.getItem('chat_token');

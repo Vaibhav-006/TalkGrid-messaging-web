@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { getSocket } from './socket';
 import * as api from './api';
 import Avatar from './Avatar';
+import { useVoiceCall } from './useVoiceCall';
+import VoiceCallOverlay from './VoiceCallOverlay';
 
 export default function Chat({ user, onLogout }) {
   const [conversations, setConversations] = useState([]);
@@ -15,8 +17,19 @@ export default function Chat({ user, onLogout }) {
   const [inputValue, setInputValue] = useState('');
   const [listError, setListError] = useState('');
   const [startingChat, setStartingChat] = useState(false);
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false
+  );
+  const [mobileChatOpen, setMobileChatOpen] = useState(false);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const onChange = () => setIsMobile(mq.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
 
   const normalizeId = (value) => {
     if (value === null || value === undefined) return null;
@@ -40,7 +53,16 @@ export default function Chat({ user, onLogout }) {
   };
 
   const loadConversations = useCallback(() => {
-    api.getConversations().then(setConversations).catch(console.error);
+    return api
+      .getConversations()
+      .then((data) => {
+        setConversations(Array.isArray(data) ? data : []);
+        setListError('');
+      })
+      .catch((err) => {
+        console.error(err);
+        setListError(err?.message || 'Failed to load conversations');
+      });
   }, []);
 
   useEffect(() => {
@@ -160,6 +182,7 @@ export default function Chat({ user, onLogout }) {
         setCurrentConv(conv);
         setMessages(conv.messages || []);
         setShowNewChat(false);
+        if (isMobile) setMobileChatOpen(true);
       })
       .catch((err) => {
         console.error(err);
@@ -190,18 +213,44 @@ export default function Chat({ user, onLogout }) {
     if (convId == null) return;
     setListError('');
     setSelectedId(convId);
+    if (isMobile) setMobileChatOpen(true);
   };
 
   const other = currentConv?.otherUser;
 
+  const switchToConversation = useCallback((convId) => {
+    if (convId == null) return;
+    setListError('');
+    setShowNewChat(false);
+    setSelectedId(convId);
+    if (isMobile) setMobileChatOpen(true);
+  }, [isMobile]);
+
+  const socket = getSocket();
+  const voice = useVoiceCall({
+    socket,
+    userId: user.id,
+    selectedConversationId: selectedId,
+    otherUser: other,
+    onSwitchConversation: switchToConversation,
+  });
+
+  const layoutClass =
+    isMobile && mobileChatOpen && selectedId
+      ? 'app-layout app-layout--mobile app-layout--mobile-chat'
+      : isMobile
+        ? 'app-layout app-layout--mobile'
+        : 'app-layout';
+
   return (
-    <div className="app-layout">
+    <div className={layoutClass}>
+      <VoiceCallOverlay voice={voice} peerUser={other} />
       <aside className="sidebar">
         <header className="sidebar-header">
           <h1>Chat</h1>
           <div className="user-pill">
             <Avatar user={user} size={28} />
-            <span>{user.display_name || user.username}</span>
+            <span className="user-pill-name">{user.display_name || user.username}</span>
           </div>
           <button className="logout-btn" onClick={onLogout} type="button">Logout</button>
         </header>
@@ -268,17 +317,41 @@ export default function Chat({ user, onLogout }) {
       </aside>
       <main className="chat-area">
         {!selectedId ? (
-          <div className="empty-chat">
+          <div className="empty-chat empty-chat--desktop-only">
             <p>Select a conversation or start a new chat</p>
-            <small>Click a name on the left, or &quot;+ New&quot; to message another user</small>
+            <small>Choose a chat from the list, or &quot;+ New&quot; to message someone</small>
           </div>
         ) : (
           <>
             <header className="chat-header">
+              {isMobile && (
+                <button
+                  type="button"
+                  className="chat-back-btn"
+                  onClick={() => setMobileChatOpen(false)}
+                  aria-label="Back to chats"
+                >
+                  <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor" aria-hidden>
+                    <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+                  </svg>
+                </button>
+              )}
               <Avatar user={other} size={42} />
-              <div>
+              <div className="chat-header-main">
                 <h2 className="name">{other?.display_name || other?.username}</h2>
               </div>
+              <button
+                type="button"
+                className="chat-call-btn"
+                onClick={() => voice.startCall()}
+                disabled={!other || voice.phase !== 'idle'}
+                title="Voice call"
+                aria-label="Start voice call"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22" aria-hidden>
+                  <path d="M20.01 15.38c-1.23 0-2.42-.2-3.53-.56-.35-.12-.74-.03-1.01.24l-1.57 1.97c-2.83-1.35-5.48-3.9-6.89-6.83l1.95-1.66c.27-.28.35-.67.24-1.02-.37-1.11-.56-2.3-.56-3.53 0-.54-.45-.99-.99-.99H4.19C3.65 3 3 3.24 3 3.99 3 13.28 10.73 21 20.01 21c.71 0 .99-.63.99-1.18v-3.45c0-.54-.45-.99-.99-.99z" />
+                </svg>
+              </button>
             </header>
             <div className="chat-messages">
               {loading ? (
@@ -333,6 +406,9 @@ export default function Chat({ user, onLogout }) {
               rows={1}
               disabled={!selectedId}
               onKeyDown={handleKeyDown}
+              enterKeyHint="send"
+              autoComplete="off"
+              autoCorrect="on"
             />
             <button type="submit" className="send-btn" aria-label="Send" disabled={!selectedId || !inputValue.trim()}>
               <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" /></svg>
