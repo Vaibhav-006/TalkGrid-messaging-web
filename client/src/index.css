@@ -126,6 +126,52 @@ a {
   color: #fff;
 }
 
+/* Presence (online / offline) */
+.avatar-with-presence {
+  position: relative;
+  vertical-align: middle;
+}
+
+.presence-dot {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  border-radius: 50%;
+  border: 2px solid var(--bg-panel);
+  box-sizing: border-box;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.presence-dot--online {
+  background: #00a884;
+}
+
+.presence-dot--offline {
+  background: #8696a0;
+}
+
+.chat-header-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.chat-header-presence {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.chat-header-presence--online {
+  color: var(--accent);
+}
+
 .conversation-list {
   flex: 1;
   overflow-y: auto;
@@ -255,11 +301,6 @@ a {
 
 .chat-back-btn:active {
   background: var(--hover);
-}
-
-.chat-header-main {
-  flex: 1;
-  min-width: 0;
 }
 
 .chat-call-btn {

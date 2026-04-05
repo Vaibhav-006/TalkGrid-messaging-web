@@ -8,6 +8,17 @@ const { connectMongo } = require('./mongo');
 const { verifyToken } = require('./auth');
 const registerVoiceHandlers = require('./voiceSignaling');
 
+/** userId -> number of active socket connections (tabs / devices) */
+const presenceCounts = new Map();
+
+function getOnlineUserIds() {
+  const ids = [];
+  for (const [userId, count] of presenceCounts) {
+    if (count > 0) ids.push(userId);
+  }
+  return ids;
+}
+
 const app = express();
 const server = http.createServer(app);
 
@@ -52,7 +63,20 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  socket.join('user:' + String(socket.userId));
+  const uid = Number(socket.userId);
+  if (Number.isNaN(uid) || uid < 1) {
+    socket.disconnect(true);
+    return;
+  }
+
+  const prevCount = presenceCounts.get(uid) || 0;
+  presenceCounts.set(uid, prevCount + 1);
+  if (prevCount === 0) {
+    socket.broadcast.emit('presence:online', { userId: uid });
+  }
+  socket.emit('presence:snapshot', { onlineUserIds: getOnlineUserIds() });
+
+  socket.join('user:' + String(uid));
   registerVoiceHandlers(socket, io, db);
 
   socket.on('message:send', ({ conversationId, content }) => {
@@ -72,7 +96,15 @@ io.on('connection', (socket) => {
     if (otherId) io.to(`user:${otherId}`).emit('message:new', payload);
   });
 
-  socket.on('disconnect', () => {});
+  socket.on('disconnect', () => {
+    const c = (presenceCounts.get(uid) || 1) - 1;
+    if (c <= 0) {
+      presenceCounts.delete(uid);
+      io.emit('presence:offline', { userId: uid });
+    } else {
+      presenceCounts.set(uid, c);
+    }
+  });
 });
 
 const PORT = Number(process.env.PORT) || 3001;

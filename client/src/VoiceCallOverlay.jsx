@@ -43,6 +43,7 @@ export default function VoiceCallOverlay({ voice, peerUser }) {
                 avatar_color: null,
               }}
               size={88}
+              presence
             />
             <h2 className="voice-call-title">{incomingName}</h2>
             <p className="voice-call-sub">Incoming voice call</p>

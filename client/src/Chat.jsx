@@ -21,14 +21,54 @@ export default function Chat({ user, onLogout }) {
     typeof window !== 'undefined' ? window.matchMedia('(max-width: 767px)').matches : false
   );
   const [mobileChatOpen, setMobileChatOpen] = useState(false);
+  const [onlineIds, setOnlineIds] = useState(() => new Set());
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
+
+  const isUserOnline = useCallback((userId) => {
+    if (userId == null || userId === '') return false;
+    return onlineIds.has(String(Number(userId)));
+  }, [onlineIds]);
 
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 767px)');
     const onChange = () => setIsMobile(mq.matches);
     mq.addEventListener('change', onChange);
     return () => mq.removeEventListener('change', onChange);
+  }, []);
+
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return;
+    const key = (id) => String(Number(id));
+
+    const onSnapshot = (payload) => {
+      const ids = payload?.onlineUserIds ?? [];
+      setOnlineIds(new Set(ids.map((x) => key(x))));
+    };
+    const onOnline = ({ userId }) => {
+      setOnlineIds((prev) => {
+        const next = new Set(prev);
+        next.add(key(userId));
+        return next;
+      });
+    };
+    const onOffline = ({ userId }) => {
+      setOnlineIds((prev) => {
+        const next = new Set(prev);
+        next.delete(key(userId));
+        return next;
+      });
+    };
+
+    socket.on('presence:snapshot', onSnapshot);
+    socket.on('presence:online', onOnline);
+    socket.on('presence:offline', onOffline);
+    return () => {
+      socket.off('presence:snapshot', onSnapshot);
+      socket.off('presence:online', onOnline);
+      socket.off('presence:offline', onOffline);
+    };
   }, []);
 
   const normalizeId = (value) => {
@@ -249,7 +289,7 @@ export default function Chat({ user, onLogout }) {
         <header className="sidebar-header">
           <h1>Chat</h1>
           <div className="user-pill">
-            <Avatar user={user} size={28} />
+            <Avatar user={user} size={28} presence={!!socket?.connected} />
             <span className="user-pill-name">{user.display_name || user.username}</span>
           </div>
           <button className="logout-btn" onClick={onLogout} type="button">Logout</button>
@@ -283,7 +323,7 @@ export default function Chat({ user, onLogout }) {
                   onClick={() => startChat(u)}
                   disabled={startingChat}
                 >
-                  <Avatar user={u} size={48} />
+                  <Avatar user={u} size={48} presence={isUserOnline(u.id)} />
                   <span className="name">{u.display_name || u.username}</span>
                 </button>
               ))}
@@ -304,7 +344,7 @@ export default function Chat({ user, onLogout }) {
                   className={`conversation-item ${c.id === selectedId ? 'active' : ''}`}
                   onClick={() => selectConversation(c.id)}
                 >
-                  <Avatar user={c.otherUser} size={48} />
+                  <Avatar user={c.otherUser} size={48} presence={isUserOnline(c.otherUser?.id)} />
                   <div className="meta">
                     <p className="name">{c.otherUser?.display_name || c.otherUser?.username}</p>
                     <p className="preview">{c.lastMessage || 'No messages yet'}</p>
@@ -336,9 +376,14 @@ export default function Chat({ user, onLogout }) {
                   </svg>
                 </button>
               )}
-              <Avatar user={other} size={42} />
+              <Avatar user={other} size={42} presence={isUserOnline(other?.id)} />
               <div className="chat-header-main">
                 <h2 className="name">{other?.display_name || other?.username}</h2>
+                <p
+                  className={`chat-header-presence ${isUserOnline(other?.id) ? 'chat-header-presence--online' : ''}`}
+                >
+                  {isUserOnline(other?.id) ? 'Online' : 'Offline'}
+                </p>
               </div>
               <button
                 type="button"
