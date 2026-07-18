@@ -10,7 +10,7 @@ const express = require('express');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const db = require('./db');
-const { connectMongo } = require('./mongo');
+const { connectMongo, saveMessageToMongo } = require('./mongo');
 const { verifyToken } = require('./auth');
 const registerVoiceHandlers = require('./voiceSignaling');
 const { registerChatSocketHandlers } = require('./socket/chatSocket');
@@ -103,7 +103,7 @@ io.on('connection', (socket) => {
   registerVoiceHandlers(socket, io, db);
   registerChatSocketHandlers(io, socket);
 
-  socket.on('message:send', ({ conversationId, content }) => {
+  socket.on('message:send', async ({ conversationId, content }) => {
     if (!content?.trim()) return;
     const convId = parseInt(conversationId, 10);
     const member = db.prepare('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?').get(convId, socket.userId);
@@ -118,6 +118,13 @@ io.on('connection', (socket) => {
       avatar_color: senderRow.avatar_color ?? senderRow.AVATAR_COLOR,
     } : null;
     const payload = { ...row, sender };
+    await saveMessageToMongo({
+      conversationSqlId: convId,
+      senderSqlId: socket.userId,
+      content: payload.content,
+    }).catch((err) => {
+      console.error('MongoMessage create failed:', err.message);
+    });
     emitToConversationMembers(io, convId, 'message:new', payload);
   });
 

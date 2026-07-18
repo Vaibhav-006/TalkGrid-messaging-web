@@ -10,7 +10,13 @@ if (!uri) {
 }
 
 async function connectMongo() {
-  if (connected) return;
+  if (connected || mongoose.connection.readyState === 1) {
+    connected = true;
+    return;
+  }
+  if (mongoose.connection.readyState === 2) {
+    return;
+  }
   if (!uri) {
     console.warn('MONGODB_URI not set; MongoDB Atlas will not be used.');
     return;
@@ -20,6 +26,15 @@ async function connectMongo() {
   });
   connected = true;
   console.log('Connected to MongoDB Atlas');
+}
+
+async function ensureMongoConnected() {
+  try {
+    await connectMongo();
+  } catch (err) {
+    console.error('MongoDB connection failed:', err.message);
+  }
+  return isMongoConnected();
 }
 
 function isMongoConnected() {
@@ -40,9 +55,26 @@ const conversationSchema = new mongoose.Schema(
 const MongoConversation = mongoose.models.MongoConversation
   || mongoose.model('MongoConversation', conversationSchema);
 
+async function saveMessageToMongo(payload) {
+  if (!payload) return null;
+  const connectedOk = await ensureMongoConnected();
+  if (!connectedOk || !MongoMessage) return null;
+
+  return MongoMessage.create({
+    conversationSqlId: payload.conversationSqlId ?? payload.conversationId ?? null,
+    senderSqlId: payload.senderSqlId ?? payload.senderId ?? null,
+    receiverSqlId: payload.receiverSqlId ?? payload.receiverId ?? null,
+    content: payload.content ?? null,
+    ciphertext: payload.ciphertext ?? null,
+    iv: payload.iv ?? null,
+  });
+}
+
 module.exports = {
   connectMongo,
+  ensureMongoConnected,
   isMongoConnected,
+  saveMessageToMongo,
   MongoUser,
   MongoConversation,
   MongoMessage,

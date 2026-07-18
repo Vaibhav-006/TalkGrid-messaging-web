@@ -1,5 +1,5 @@
 const db = require('./db');
-const { MongoMessage, isMongoConnected } = require('./mongo');
+const { saveMessageToMongo } = require('./mongo');
 
 const ENCRYPTED_PREVIEW = '🔒 Encrypted message';
 
@@ -74,17 +74,15 @@ async function saveAndBroadcastEncryptedMessage(io, {
     io.to(`user:${sid}`).emit('receive_message', outbound);
   }
 
-  if (isMongoConnected() && MongoMessage) {
-    MongoMessage.create({
-      conversationSqlId: Number.isNaN(convIdNum) ? null : convIdNum,
-      senderSqlId: sid,
-      receiverSqlId: rid,
-      ciphertext,
-      iv,
-    }).catch((err) => {
-      console.error('[E2EE] MongoMessage create failed:', err.message);
-    });
-  }
+  await saveMessageToMongo({
+    conversationSqlId: Number.isNaN(convIdNum) ? null : convIdNum,
+    senderSqlId: sid,
+    receiverSqlId: rid,
+    ciphertext,
+    iv,
+  }).catch((err) => {
+    console.error('[E2EE] MongoMessage create failed:', err.message);
+  });
 
   return outbound;
 }

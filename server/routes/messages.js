@@ -1,7 +1,6 @@
 const express = require('express');
 const db = require('../db');
-const { MongoMessage } = require('../mongo');
-const { isMongoConnected } = require('../mongo');
+const { MongoMessage, saveMessageToMongo, ensureMongoConnected } = require('../mongo');
 const { authMiddleware } = require('../auth');
 const { emitToConversationMembers } = require('../conversationUtils');
 const { saveAndBroadcastEncryptedMessage } = require('../e2eeMessages');
@@ -25,10 +24,27 @@ function createRouter(io) {
   }
 
   // Get messages for a conversation
-  router.get('/conversation/:conversationId', (req, res) => {
+  router.get('/conversation/:conversationId', async (req, res) => {
     const convId = parseInt(req.params.conversationId, 10);
     const member = db.prepare('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?').get(convId, req.user.id);
     if (!member) return res.status(404).json({ error: 'Conversation not found' });
+
+    const mongoReady = await ensureMongoConnected();
+    if (mongoReady) {
+      const mongoMessages = await MongoMessage.find({ conversationSqlId: convId }).sort({ createdAt: 1 }).lean();
+      if (mongoMessages?.length) {
+        const mapped = mongoMessages.map((message) => ({
+          id: message._id ?? message.id,
+          conversation_id: convId,
+          sender_id: message.senderSqlId,
+          content: message.content ?? '',
+          created_at: message.createdAt ?? message.created_at,
+          sender: null,
+        }));
+        return res.json(mapped);
+      }
+    }
+
     const messages = db.prepare(`
       SELECT id, sender_id, content, created_at
       FROM messages
@@ -39,7 +55,7 @@ function createRouter(io) {
   });
 
   // Send a message (works even when socket is not connected)
-  router.post('/send', (req, res) => {
+  router.post('/send', async (req, res) => {
     const { conversationId, content } = req.body;
     if (!content?.trim()) return res.status(400).json({ error: 'Content required' });
     const convId = parseInt(conversationId, 10);
@@ -62,15 +78,13 @@ function createRouter(io) {
       created_at: row?.created_at ?? row?.CREATED_AT,
       sender,
     };
-    if (isMongoConnected() && MongoMessage) {
-      MongoMessage.create({
-        conversationSqlId: convId,
-        senderSqlId: req.user.id,
-        content: payload.content,
-      }).catch((err) => {
-        console.error('MongoMessage create failed:', err.message);
-      });
-    }
+    await saveMessageToMongo({
+      conversationSqlId: convId,
+      senderSqlId: req.user.id,
+      content: payload.content,
+    }).catch((err) => {
+      console.error('MongoMessage create failed:', err.message);
+    });
     emitToConversationMembers(io, convId, 'message:new', payload);
     res.status(201).json(payload);
   });
