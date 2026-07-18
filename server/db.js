@@ -122,6 +122,18 @@ try {
   try {
     db.run("ALTER TABLE conversation_members ADD COLUMN role TEXT DEFAULT 'member'");
   } catch (_) {}
+  try {
+    db.run('ALTER TABLE users ADD COLUMN public_key TEXT');
+  } catch (_) {}
+  try {
+    db.run('ALTER TABLE messages ADD COLUMN ciphertext TEXT');
+  } catch (_) {}
+  try {
+    db.run('ALTER TABLE messages ADD COLUMN iv TEXT');
+  } catch (_) {}
+  try {
+    db.run('ALTER TABLE messages ADD COLUMN receiver_id INTEGER');
+  } catch (_) {}
 
   // Ensure each existing group has at least one admin (earliest joined member)
   const groupRows = [];

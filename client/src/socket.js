@@ -11,7 +11,10 @@ const DEFAULT_PROD_SOCKET = 'https://talkgrid-messaging-web.onrender.com';
 function resolveSocketUrl() {
   const fromEnv = import.meta.env.VITE_SOCKET_URL?.trim();
   if (fromEnv) return fromEnv.replace(/\/+$/, '');
-  if (import.meta.env.DEV) return 'http://localhost:3001';
+  if (import.meta.env.DEV) {
+    // Same origin — Vite proxies /socket.io → localhost:3001
+    return window.location.origin;
+  }
   if (typeof window !== 'undefined') {
     const h = window.location.hostname;
     if (h === 'localhost' || h === '127.0.0.1') {
@@ -28,7 +31,10 @@ export function connectSocket(token) {
   socket = io(url, {
     path: '/socket.io',
     auth: { token },
-    transports: ['websocket', 'polling'],
+    transports: ['polling', 'websocket'],
+    reconnection: true,
+    reconnectionAttempts: 10,
+    reconnectionDelay: 1000,
   });
   return socket;
 }

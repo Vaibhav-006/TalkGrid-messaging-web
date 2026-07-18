@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { getSocket } from './socket';
 import * as api from './api';
+import { useE2EE } from './hooks/useE2EE';
+import { deletePrivateKey } from './utils/keyStorage';
 import Avatar from './Avatar';
 import GroupAvatar from './GroupAvatar';
 import { useVoiceCall } from './useVoiceCall';
@@ -44,7 +46,9 @@ export default function Chat({ user, onLogout }) {
   const [chatActionError, setChatActionError] = useState('');
 const [statuses, setStatuses] = useState([]);
 const [selectedStatuses, setSelectedStatuses] = useState(null);
-
+  const [peerPublicKey, setPeerPublicKey] = useState(null);
+  const [peerKeyError, setPeerKeyError] = useState('');
+  const [sendError, setSendError] = useState('');
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
   const chatMenuRef = useRef(null);
@@ -164,6 +168,8 @@ useEffect(() => {
     setShowChatMenu(false);
     setChatActionError('');
     setLoading(true);
+    setPeerPublicKey(null);
+    setPeerKeyError('');
     api.getConversation(selectedId).then((data) => {
       setCurrentConv(data);
       setMessages(data.messages || []);
@@ -181,6 +187,7 @@ useEffect(() => {
     const socket = getSocket();
     if (!socket) return;
     const onNewMessage = (msg) => {
+      if (msg.ciphertext || msg.encrypted) return;
       const cid = msg.conversation_id ?? msg.conversation_ID;
       if (cid === selectedId || cid == null) {
         const fixed = {
@@ -262,21 +269,6 @@ useEffect(() => {
       socket.off('conversation:deleted', onConversationDeleted);
     };
   }, [selectedId, loadConversations, isMobile]);
-
-  const handleSend = async (e) => {
-    if (e) e.preventDefault();
-    const content = inputValue.trim();
-    if (!content || !selectedId) return;
-    setInputValue('');
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
-    try {
-      // Let the server broadcast the message over socket; we don't push it manually here
-      await api.sendMessage(selectedId, content);
-    } catch (err) {
-      console.error(err);
-      setInputValue(content);
-    }
-  };
 
   const handleDeleteMessage = async (rawId) => {
     const id = normalizeId(rawId);
@@ -408,6 +400,185 @@ useEffect(() => {
 
   const isGroup = !!currentConv?.isGroup;
   const other = isGroup ? null : currentConv?.otherUser;
+
+  const socket = getSocket();
+  const {
+    isDirectE2EEReady,
+    keyError: e2eeKeyError,
+    initializeKeys: reinitializeKeys,
+    sendEncryptedMessage,
+    decryptChatMessage,
+    decryptMessageList,
+  } = useE2EE({
+    userId: user.id,
+    socket,
+    peerId: other?.id,
+    peerPublicKey,
+  });
+
+  useEffect(() => {
+    if (!other?.id || isGroup) {
+      setPeerPublicKey(null);
+      setPeerKeyError('');
+      return;
+    }
+    setPeerKeyError('');
+    let cancelled = false;
+    api.getUserPublicKey(other.id)
+      .then((data) => {
+        if (!cancelled) setPeerPublicKey(data.publicKey);
+      })
+      .catch((err) => {
+        console.error(err);
+        if (!cancelled) {
+          setPeerPublicKey(null);
+          setPeerKeyError(err?.message || 'Could not load encryption key for this user');
+        }
+      });
+    return () => { cancelled = true; };
+  }, [other?.id, isGroup, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId || isGroup || !peerPublicKey) return;
+    let cancelled = false;
+    (async () => {
+      const needsDecrypt = messages.some(
+        (m) => (m.ciphertext || m.encrypted)
+          && m.content === '🔒 Encrypted message'
+      );
+      if (!needsDecrypt) return;
+      try {
+        const decrypted = await decryptMessageList(messages, peerPublicKey);
+        if (!cancelled) setMessages(decrypted);
+      } catch (err) {
+        console.error('[E2EE] Failed to decrypt history:', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedId, isGroup, peerPublicKey, messages, decryptMessageList]);
+
+  useEffect(() => {
+    const sock = getSocket();
+    if (!sock || isGroup || !peerPublicKey || !other?.id) return;
+
+    const onReceive = async (payload) => {
+      if (Number(payload.senderId ?? payload.sender_id) === Number(user.id)) return;
+
+      const convId = payload.conversationId ?? payload.conversation_id;
+      if (convId != null && Number(convId) !== Number(selectedId)) return;
+
+      const involved =
+        Number(payload.senderId) === Number(user.id) ||
+        Number(payload.receiverId) === Number(user.id);
+      if (!involved) return;
+
+      const peerId = Number(payload.senderId) === Number(user.id)
+        ? payload.receiverId
+        : payload.senderId;
+      if (Number(peerId) !== Number(other.id)) return;
+
+      try {
+        const content = await decryptChatMessage(payload, peerPublicKey);
+        const fixed = {
+          id: payload.id ?? `${payload.senderId}-${payload.iv}`,
+          sender_id: payload.senderId ?? payload.sender_id,
+          receiver_id: payload.receiverId ?? payload.receiver_id,
+          content,
+          ciphertext: payload.ciphertext,
+          iv: payload.iv,
+          encrypted: true,
+          created_at: payload.created_at ?? payload.createdAt ?? new Date().toISOString(),
+        };
+        setMessages((prev) => {
+          const id = normalizeId(fixed.id);
+          if (id != null && prev.some((m) => normalizeId(m.id ?? m.ID) === id)) return prev;
+          return [...prev, fixed];
+        });
+        loadConversations();
+      } catch (err) {
+        console.error('[E2EE] receive_message failed:', err);
+      }
+    };
+
+    sock.on('receive_message', onReceive);
+    return () => sock.off('receive_message', onReceive);
+  }, [selectedId, isGroup, peerPublicKey, other?.id, user.id, decryptChatMessage, loadConversations]);
+
+  const hasUndecryptableMessages = !isGroup && messages.some(
+    (m) => m.content === '[Unable to decrypt message]'
+  );
+
+  const handleResetEncryptionKeys = async () => {
+    if (!window.confirm(
+      'Reset your encryption keys? Old encrypted messages will stay unreadable until both users reset and send new messages.'
+    )) return;
+    try {
+      await deletePrivateKey(user.id);
+      await reinitializeKeys();
+      if (other?.id) {
+        const data = await api.getUserPublicKey(other.id);
+        setPeerPublicKey(data.publicKey);
+      }
+      if (selectedId) {
+        const conv = await api.getConversation(selectedId);
+        setMessages(conv.messages || []);
+      }
+      setSendError('');
+      setPeerKeyError('');
+    } catch (err) {
+      setSendError(err?.message || 'Failed to reset encryption keys');
+    }
+  };
+
+  const handleSend = async (e) => {
+    if (e) e.preventDefault();
+    const content = inputValue.trim();
+    if (!content || !selectedId) return;
+    setInputValue('');
+    setSendError('');
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+
+    const useE2EEPath = !isGroup && isDirectE2EEReady;
+
+    try {
+      if (useE2EEPath) {
+        const sent = await sendEncryptedMessage(content, {
+          conversationId: selectedId,
+          receiverId: other.id,
+          recipientPublicKey: peerPublicKey,
+        });
+        setMessages((prev) => {
+          const id = normalizeId(sent?.id);
+          if (id != null && prev.some((m) => normalizeId(m.id ?? m.ID) === id)) return prev;
+          return [...prev, {
+            id: sent.id,
+            sender_id: user.id,
+            receiver_id: other.id,
+            content,
+            ciphertext: sent.ciphertext,
+            iv: sent.iv,
+            encrypted: true,
+            created_at: sent.created_at ?? sent.createdAt ?? new Date().toISOString(),
+          }];
+        });
+        loadConversations();
+      } else {
+        if (!isGroup && !isDirectE2EEReady) {
+          setSendError(
+            peerKeyError || e2eeKeyError || 'End-to-end encryption is not ready for this chat'
+          );
+          setInputValue(content);
+          return;
+        }
+        await api.sendMessage(selectedId, content);
+      }
+    } catch (err) {
+      console.error(err);
+      setSendError(err?.message || 'Failed to send message');
+      setInputValue(content);
+    }
+  };
+
   const memberCount = isGroup ? (currentConv?.members?.length ?? 0) : 0;
   const isGroupAdmin = isGroup && currentConv?.myRole === 'admin';
   const hasOtherGroupAdmin = isGroup && (currentConv?.members || []).some(
@@ -523,7 +694,6 @@ useEffect(() => {
     if (isMobile) setMobileChatOpen(true);
   }, [isMobile]);
 
-  const socket = getSocket();
   const voice = useVoiceCall({
     socket,
     userId: user.id,
@@ -763,7 +933,9 @@ useEffect(() => {
                 <p className={`chat-header-presence ${!isGroup && isUserOnline(other?.id) ? 'chat-header-presence--online' : ''}`}>
                   {isGroup
                     ? `${memberCount} members`
-                    : (isUserOnline(other?.id) ? 'Online' : 'Offline')}
+                    : isDirectE2EEReady
+                      ? (isUserOnline(other?.id) ? 'Online · End-to-end encrypted' : 'Offline · End-to-end encrypted')
+                      : (isUserOnline(other?.id) ? 'Online' : 'Offline')}
                 </p>
               </div>
               {!isGroup && (
@@ -841,6 +1013,26 @@ useEffect(() => {
             </header>
             {chatActionError && (
               <div className="chat-action-error" role="alert">{chatActionError}</div>
+            )}
+            {sendError && (
+              <div className="chat-action-error" role="alert">{sendError}</div>
+            )}
+            {!isGroup && peerKeyError && (
+              <div className="chat-action-error" role="alert">{peerKeyError}</div>
+            )}
+            {!isGroup && hasUndecryptableMessages && (
+              <div className="chat-action-error" role="alert">
+                Some messages cannot be decrypted — keys are out of sync.
+                Both users must reset keys (button below) and send new messages.
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  style={{ marginLeft: 8 }}
+                  onClick={handleResetEncryptionKeys}
+                >
+                  Reset my keys
+                </button>
+              </div>
             )}
             {showGroupSettings && isGroup && (
               <div className="group-settings-backdrop" onClick={() => setShowGroupSettings(false)}>
@@ -957,7 +1149,11 @@ useEffect(() => {
                 t.style.height = 'auto';
                 t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
               }}
-              placeholder={selectedId ? 'Type a message' : 'Select a conversation to start messaging'}
+              placeholder={
+                selectedId
+                  ? (!isGroup && isDirectE2EEReady ? 'Type an encrypted message' : 'Type a message')
+                  : 'Select a conversation to start messaging'
+              }
               rows={1}
               disabled={!selectedId}
               onKeyDown={handleKeyDown}

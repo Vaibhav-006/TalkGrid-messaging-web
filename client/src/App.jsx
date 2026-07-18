@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
-import { connectSocket, disconnectSocket, getSocket } from './socket';
+import { connectSocket, disconnectSocket } from './socket';
 import * as api from './api';
 import Login from './Login';
 import Register from './Register';
 import Chat from './Chat';
+import { ensureUserEncryptionKeys } from './utils/e2eeSetup';
 
 const TOKEN_KEY = 'chat_token';
 const USER_KEY = 'chat_user';
@@ -26,13 +27,17 @@ function App() {
       .then((u) => {
         setUser(u);
         localStorage.setItem(USER_KEY, JSON.stringify(u));
+        ensureUserEncryptionKeys(u.id).catch((err) => {
+          console.error('[E2EE] Key setup failed:', err);
+        });
       })
-      .catch(() => {
+      .catch((err) => {
         localStorage.removeItem(TOKEN_KEY);
         localStorage.removeItem(USER_KEY);
         setToken(null);
         setUser(null);
         disconnectSocket();
+        setError(err?.message || 'Session expired — please sign in again');
       })
       .finally(() => setLoading(false));
   }, [token]);
@@ -44,6 +49,9 @@ function App() {
     setUser(u);
     setError('');
     connectSocket(t);
+    ensureUserEncryptionKeys(u.id).catch((err) => {
+      console.error('[E2EE] Key setup failed:', err);
+    });
   };
 
   const handleRegister = (u, t) => {
@@ -62,7 +70,11 @@ function App() {
   if (loading) {
     return (
       <div className="auth-screen">
-        <div style={{ color: 'var(--text-muted)' }}>Loading…</div>
+        <div className="auth-loading">
+          <div className="loading-spinner" aria-hidden />
+          <p>Connecting to TalkGrid…</p>
+          <p className="auth-loading-hint">Make sure <code>npm run dev</code> is running</p>
+        </div>
       </div>
     );
   }

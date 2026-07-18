@@ -1,8 +1,10 @@
 const express = require('express');
 const db = require('../db');
 const { MongoMessage } = require('../mongo');
+const { isMongoConnected } = require('../mongo');
 const { authMiddleware } = require('../auth');
 const { emitToConversationMembers } = require('../conversationUtils');
+const { saveAndBroadcastEncryptedMessage } = require('../e2eeMessages');
 
 function createRouter(io) {
   const router = express.Router();
@@ -60,7 +62,7 @@ function createRouter(io) {
       created_at: row?.created_at ?? row?.CREATED_AT,
       sender,
     };
-    if (MongoMessage) {
+    if (isMongoConnected() && MongoMessage) {
       MongoMessage.create({
         conversationSqlId: convId,
         senderSqlId: req.user.id,
@@ -71,6 +73,38 @@ function createRouter(io) {
     }
     emitToConversationMembers(io, convId, 'message:new', payload);
     res.status(201).json(payload);
+  });
+
+  /** Send an E2EE message via REST (reliable fallback; also emits receive_message over socket). */
+  router.post('/send-encrypted', async (req, res) => {
+    try {
+      const { conversationId, receiverId, ciphertext, iv } = req.body;
+      const ct = typeof ciphertext === 'string' ? ciphertext.trim() : '';
+      const ivStr = typeof iv === 'string' ? iv.trim() : '';
+      const rid = parseInt(receiverId, 10);
+      const convId = conversationId != null ? parseInt(conversationId, 10) : null;
+
+      if (!rid || Number.isNaN(rid)) {
+        return res.status(400).json({ error: 'Valid receiverId required' });
+      }
+      if (!ct || !ivStr) {
+        return res.status(400).json({ error: 'ciphertext and iv are required' });
+      }
+
+      const outbound = await saveAndBroadcastEncryptedMessage(io, {
+        senderId: Number(req.user.id),
+        receiverId: rid,
+        ciphertext: ct,
+        iv: ivStr,
+        conversationId: convId,
+      });
+
+      return res.status(201).json(outbound);
+    } catch (err) {
+      console.error('[E2EE] POST /send-encrypted failed:', err);
+      const status = err.status || 500;
+      return res.status(status).json({ error: err.message || 'Failed to send encrypted message' });
+    }
   });
 
   // Delete a message (only sender, only within 5 minutes). Deletes for both ends via socket event.

@@ -4,6 +4,11 @@ let connected = false;
 
 const uri = process.env.MONGODB_URI;
 
+/** Without a URI, fail Mongo ops immediately instead of buffering 10s per call. */
+if (!uri) {
+  mongoose.set('bufferCommands', false);
+}
+
 async function connectMongo() {
   if (connected) return;
   if (!uri) {
@@ -17,15 +22,12 @@ async function connectMongo() {
   console.log('Connected to MongoDB Atlas');
 }
 
-const userSchema = new mongoose.Schema(
-  {
-    sqlId: { type: Number, index: true, unique: true },
-    username: { type: String, required: true, lowercase: true, trim: true, index: true },
-    displayName: { type: String },
-    avatarColor: { type: String, default: '#25D366' },
-  },
-  { timestamps: true }
-);
+function isMongoConnected() {
+  return Boolean(uri) && connected && mongoose.connection.readyState === 1;
+}
+
+const { User: MongoUser } = require('./models/User');
+const { Message: MongoMessage } = require('./models/Message');
 
 const conversationSchema = new mongoose.Schema(
   {
@@ -35,21 +37,12 @@ const conversationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-const messageSchema = new mongoose.Schema(
-  {
-    conversationSqlId: { type: Number, index: true },
-    senderSqlId: { type: Number, index: true },
-    content: { type: String, required: true },
-  },
-  { timestamps: true }
-);
-
-const MongoUser = mongoose.model('MongoUser', userSchema);
-const MongoConversation = mongoose.model('MongoConversation', conversationSchema);
-const MongoMessage = mongoose.model('MongoMessage', messageSchema);
+const MongoConversation = mongoose.models.MongoConversation
+  || mongoose.model('MongoConversation', conversationSchema);
 
 module.exports = {
   connectMongo,
+  isMongoConnected,
   MongoUser,
   MongoConversation,
   MongoMessage,

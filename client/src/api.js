@@ -14,6 +14,22 @@ function resolveApiBase() {
 }
 
 const API = resolveApiBase();
+const DEFAULT_TIMEOUT_MS = 8000;
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error('Server not responding — run npm run dev and ensure port 3001 is up');
+    }
+    throw new Error('Cannot reach server — run npm run dev in the project folder');
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function getToken() {
   return localStorage.getItem('chat_token');
@@ -28,7 +44,7 @@ function headers() {
 }
 
 export async function register(username, password, displayName) {
-  const res = await fetch(`${API}/auth/register`, {
+  const res = await fetchWithTimeout(`${API}/auth/register`, {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify({ username, password, displayName: displayName || username }),
@@ -39,7 +55,7 @@ export async function register(username, password, displayName) {
 }
 
 export async function login(username, password) {
-  const res = await fetch(`${API}/auth/login`, {
+  const res = await fetchWithTimeout(`${API}/auth/login`, {
     method: 'POST',
     headers: headers(),
     body: JSON.stringify({ username, password }),
@@ -50,7 +66,7 @@ export async function login(username, password) {
 }
 
 export async function getMe() {
-  const res = await fetch(`${API}/auth/me`, { headers: headers() });
+  const res = await fetchWithTimeout(`${API}/auth/me`, { headers: headers() });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Not authenticated');
   return data;
@@ -108,6 +124,18 @@ export async function sendMessage(conversationId, content) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Failed to send message');
+  return data;
+}
+
+/** Send an encrypted direct message (ciphertext + IV already computed client-side). */
+export async function sendEncryptedMessage(conversationId, receiverId, ciphertext, iv) {
+  const res = await fetch(`${API}/messages/send-encrypted`, {
+    method: 'POST',
+    headers: headers(),
+    body: JSON.stringify({ conversationId, receiverId, ciphertext, iv }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to send encrypted message');
   return data;
 }
 
@@ -191,6 +219,26 @@ export async function deleteStatus(id) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || 'Failed to delete status');
+  return data;
+}
+
+/** Upload ECDH public key (SPKI Base64) for the authenticated user. */
+export async function uploadPublicKey(publicKey) {
+  const res = await fetch(`${API}/users/me/public-key`, {
+    method: 'PUT',
+    headers: headers(),
+    body: JSON.stringify({ publicKey }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to upload public key');
+  return data;
+}
+
+/** Fetch a user's ECDH public key by SQLite user id. */
+export async function getUserPublicKey(userId) {
+  const res = await fetch(`${API}/users/${userId}/public-key`, { headers: headers() });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to load public key');
   return data;
 }
 

@@ -1,4 +1,10 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
+
+// Must run before any Mongoose model is loaded — prevents 10s buffer timeouts without MONGODB_URI.
+if (!process.env.MONGODB_URI) {
+  require('mongoose').set('bufferCommands', false);
+}
+
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
@@ -7,6 +13,7 @@ const db = require('./db');
 const { connectMongo } = require('./mongo');
 const { verifyToken } = require('./auth');
 const registerVoiceHandlers = require('./voiceSignaling');
+const { registerChatSocketHandlers } = require('./socket/chatSocket');
 const { emitToConversationMembers } = require('./conversationUtils');
 
 /** userId -> number of active socket connections (tabs / devices) */
@@ -48,6 +55,21 @@ app.use(cors({
 }));
 app.use(express.json());
 
+app.get('/', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html>
+<html><head><title>TalkGrid API</title></head>
+<body style="font-family:system-ui,sans-serif;padding:2rem;max-width:32rem">
+  <h1>TalkGrid API is running</h1>
+  <p>This port (<code>3001</code>) is the <strong>backend API only</strong> — not the chat UI.</p>
+  <p>Open the app here: <a href="http://localhost:5173"><strong>http://localhost:5173</strong></a></p>
+  <p><a href="/api/health">/api/health</a></p>
+</body></html>`);
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, service: 'TalkGrid API' });
+});
+
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/users', require('./routes/users'));
 app.use('/api/conversations', require('./routes/conversations')(io));
@@ -79,6 +101,7 @@ io.on('connection', (socket) => {
 
   socket.join('user:' + String(uid));
   registerVoiceHandlers(socket, io, db);
+  registerChatSocketHandlers(io, socket);
 
   socket.on('message:send', ({ conversationId, content }) => {
     if (!content?.trim()) return;
@@ -116,6 +139,7 @@ const PORT = Number(process.env.PORT) || 3001;
     console.error('MongoDB connection failed:', err.message);
   });
   server.listen(PORT, () => {
-    console.log(`Server running at http://localhost:${PORT}`);
+    console.log(`API server:  http://localhost:${PORT}`);
+    console.log(`Chat app:    http://localhost:5173  ← open this in your browser`);
   });
 })();

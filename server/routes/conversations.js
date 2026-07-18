@@ -1,6 +1,6 @@
 const express = require('express');
 const db = require('../db');
-const { MongoConversation } = require('../mongo');
+const { MongoConversation, isMongoConnected } = require('../mongo');
 const { authMiddleware } = require('../auth');
 const {
   rowId,
@@ -38,10 +38,17 @@ function getMembers(conversationId) {
 }
 
 function getLastMessage(conversationId) {
-  return db.prepare(`
-    SELECT content, created_at FROM messages
+  const row = db.prepare(`
+    SELECT content, ciphertext, created_at FROM messages
     WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1
   `).get(conversationId);
+  if (!row) return null;
+  const ciphertext = row.ciphertext ?? row.CIPHERTEXT;
+  const content = row.content ?? row.CONTENT;
+  return {
+    content: ciphertext ? '🔒 Encrypted message' : content,
+    created_at: row.created_at ?? row.CREATED_AT,
+  };
 }
 
 function buildConversationSummary(conversationId, myId) {
@@ -82,7 +89,7 @@ function getConversationById(conversationId, myId) {
 
 function getMessages(conversationId) {
   const rows = db.prepare(`
-    SELECT m.id, m.sender_id, m.content, m.created_at,
+    SELECT m.id, m.sender_id, m.receiver_id, m.content, m.ciphertext, m.iv, m.created_at,
            u.username, u.display_name, u.avatar_color
     FROM messages m
     LEFT JOIN users u ON u.id = m.sender_id
@@ -93,7 +100,11 @@ function getMessages(conversationId) {
   return rows.map((r) => ({
     id: r.id ?? r.ID,
     sender_id: r.sender_id ?? r.SENDER_ID,
+    receiver_id: r.receiver_id ?? r.RECEIVER_ID ?? null,
     content: r.content ?? r.CONTENT,
+    ciphertext: r.ciphertext ?? r.CIPHERTEXT ?? null,
+    iv: r.iv ?? r.IV ?? null,
+    encrypted: !!(r.ciphertext ?? r.CIPHERTEXT),
     created_at: r.created_at ?? r.CREATED_AT,
     sender: formatUser({
       id: r.sender_id ?? r.SENDER_ID,
@@ -164,7 +175,7 @@ function createRouter(io) {
         'INSERT INTO conversation_members (conversation_id, user_id) VALUES (?, ?), (?, ?)'
       ).run(convId, myId, convId, otherId);
 
-      if (MongoConversation) {
+      if (isMongoConnected() && MongoConversation) {
         MongoConversation.findOneAndUpdate(
           { sqlId: convId },
           { sqlId: convId, participantsSqlIds: [myId, otherId], isGroup: false },
@@ -231,7 +242,7 @@ function createRouter(io) {
         insertMember.run(convId, uid, 'member');
       }
 
-      if (MongoConversation) {
+      if (isMongoConnected() && MongoConversation) {
         MongoConversation.findOneAndUpdate(
           { sqlId: convId },
           { sqlId: convId, participantsSqlIds: allMemberIds, isGroup: true, name },

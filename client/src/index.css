@@ -918,6 +918,34 @@ a {
   pointer-events: none;
 }
 
+.auth-loading {
+  position: relative;
+  z-index: 1;
+  text-align: center;
+  color: var(--text);
+}
+
+.auth-loading p {
+  margin: 12px 0 0;
+  font-size: 1rem;
+}
+
+.auth-loading-hint {
+  color: var(--text-muted) !important;
+  font-size: 0.875rem !important;
+}
+
+.auth-loading-hint code {
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.auth-loading .loading-spinner {
+  margin: 0 auto;
+}
+
 .auth-card {
   width: 100%;
   max-width: 400px;

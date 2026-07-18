@@ -1,7 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../db');
-const { MongoUser } = require('../mongo');
+const { MongoUser, isMongoConnected } = require('../mongo');
 const { signToken } = require('../auth');
 
 const router = express.Router();
@@ -30,7 +30,7 @@ router.post('/register', (req, res) => {
       display_name: user.display_name ?? user.DISPLAY_NAME ?? null,
       avatar_color: user.avatar_color ?? user.AVATAR_COLOR ?? null,
     };
-    if (MongoUser) {
+    if (isMongoConnected() && MongoUser) {
       MongoUser.findOneAndUpdate(
         { sqlId: safe.id },
         {
