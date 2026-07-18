@@ -11,7 +11,8 @@ export default function Register({ onRegister, onSwitch, error, setError }) {
     setError('');
     try {
       const { user, token } = await api.register(username, password, displayName || username);
-      onRegister(user, token);
+      // Pass password to onRegister so it can be used for encrypted key backup creation
+      onRegister(user, token, password);
     } catch (err) {
       setError(err.message || 'Registration failed');
     }
@@ -59,6 +60,9 @@ export default function Register({ onRegister, onSwitch, error, setError }) {
           placeholder="Min 4 characters"
           required
         />
+        <p className="password-hint" style={{ fontSize: '0.85rem', color: '#999', marginTop: '8px' }}>
+          💡 Your password is used to securely backup encryption keys for multi-device access.
+        </p>
         <button type="submit">Sign up</button>
       </form>
       <p className="toggle">

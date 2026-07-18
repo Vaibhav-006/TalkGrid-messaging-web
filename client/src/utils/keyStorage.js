@@ -147,5 +147,63 @@ export async function deletePrivateKey(userId) {
     };
     tx.objectStore(STORE_NAME).delete(storageKey(userId));
     tx.objectStore(STORE_NAME).delete(publicStorageKey(userId));
+    tx.objectStore(STORE_NAME).delete(`backup_${String(userId)}`);
+  });
+}
+
+/**
+ * ENHANCEMENT: Store encrypted private key backup locally for reference.
+ * Format: { encryptedPrivateKey, iv, salt } all in Base64
+ */
+function encryptedBackupKey(userId) {
+  return `backup_${String(userId)}`;
+}
+
+/**
+ * Save encrypted private key backup to IndexedDB (for caching).
+ * The actual encrypted backup also lives on the backend.
+ * 
+ * @param {string|number} userId
+ * @param {Object} backup - { encryptedPrivateKey, iv, salt } in Base64
+ */
+export async function saveEncryptedPrivateKeyBackup(userId, backup) {
+  if (!userId || !backup) {
+    throw new Error('saveEncryptedPrivateKeyBackup requires userId and backup object');
+  }
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error ?? new Error('IndexedDB write failed'));
+    };
+    tx.objectStore(STORE_NAME).put(backup, encryptedBackupKey(userId));
+  });
+}
+
+/**
+ * Retrieve encrypted private key backup from IndexedDB.
+ * 
+ * @param {string|number} userId
+ * @returns {Promise<Object|null>} - { encryptedPrivateKey, iv, salt } or null
+ */
+export async function getEncryptedPrivateKeyBackup(userId) {
+  if (!userId) return null;
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const request = tx.objectStore(STORE_NAME).get(encryptedBackupKey(userId));
+    request.onsuccess = () => {
+      db.close();
+      resolve(request.result ?? null);
+    };
+    request.onerror = () => {
+      db.close();
+      reject(request.error ?? new Error('IndexedDB read failed'));
+    };
   });
 }

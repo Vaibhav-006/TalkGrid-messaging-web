@@ -88,4 +88,106 @@ router.get('/:userId/public-key', async (req, res) => {
   return res.json({ userId: targetId, publicKey });
 });
 
+/**
+ * FIX 2: Fetch authenticated user's full profile including encrypted private key backup.
+ * Used during multi-device recovery flow to retrieve encrypted backup.
+ */
+router.get('/me/profile', async (req, res) => {
+  const userId = req.user.id;
+
+  // Try MongoDB first (has all backup fields)
+  if (isMongoConnected() && MongoUser) {
+    const mongoUser = await MongoUser.findOne({ sqlId: userId }).lean();
+    if (mongoUser) {
+      return res.json({
+        userId: mongoUser.sqlId,
+        username: mongoUser.username,
+        displayName: mongoUser.displayName,
+        avatarColor: mongoUser.avatarColor,
+        publicKey: mongoUser.publicKey || null,
+        encryptedPrivateKeyBackup: mongoUser.encryptedPrivateKeyBackup || null,
+        encryptedPrivateKeyIV: mongoUser.encryptedPrivateKeyIV || null,
+        encryptedPrivateKeySalt: mongoUser.encryptedPrivateKeySalt || null,
+        encryptedBackupUpdatedAt: mongoUser.encryptedBackupUpdatedAt || null,
+      });
+    }
+  }
+
+  // Fallback to SQLite (limited backup info)
+  const row = db.prepare(`
+    SELECT id, username, display_name, avatar_color, public_key
+    FROM users
+    WHERE id = ?
+  `).get(userId);
+
+  if (!row) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+
+  return res.json({
+    userId: row.id ?? row.ID,
+    username: row.username ?? row.USERNAME,
+    displayName: row.display_name ?? row.DISPLAY_NAME,
+    avatarColor: row.avatar_color ?? row.AVATAR_COLOR,
+    publicKey: row.public_key ?? row.PUBLIC_KEY ?? null,
+    encryptedPrivateKeyBackup: null, // SQLite does not store encrypted backups
+    encryptedPrivateKeyIV: null,
+    encryptedPrivateKeySalt: null,
+    encryptedBackupUpdatedAt: null,
+  });
+});
+
+/**
+ * FIX 2: Upload / update encrypted private key backup for multi-device recovery.
+ * 
+ * The backup contains:
+ * - encryptedPrivateKey: Private key encrypted with user's password (PBKDF2 + AES-GCM)
+ * - iv: IV used for encryption (Base64, 12 bytes)
+ * - salt: PBKDF2 salt (Base64, typically 16 bytes)
+ * 
+ * Only stored on MongoDB (provides better structured data support).
+ */
+router.put('/me/encrypted-key-backup', async (req, res) => {
+  const encryptedPrivateKey = typeof req.body?.encryptedPrivateKey === 'string'
+    ? req.body.encryptedPrivateKey.trim()
+    : '';
+  const iv = typeof req.body?.iv === 'string' ? req.body.iv.trim() : '';
+  const salt = typeof req.body?.salt === 'string' ? req.body.salt.trim() : '';
+
+  if (!encryptedPrivateKey || !iv || !salt) {
+    return res.status(400).json({
+      error: 'encryptedPrivateKey, iv, and salt (all Base64) required',
+    });
+  }
+
+  if (!isMongoConnected() || !MongoUser) {
+    return res.status(503).json({ error: 'MongoDB not available for backup storage' });
+  }
+
+  try {
+    const updated = await MongoUser.findOneAndUpdate(
+      { sqlId: req.user.id },
+      {
+        encryptedPrivateKeyBackup: encryptedPrivateKey,
+        encryptedPrivateKeyIV: iv,
+        encryptedPrivateKeySalt: salt,
+        encryptedBackupUpdatedAt: new Date(),
+      },
+      { upsert: false, new: true }
+    );
+
+    if (!updated) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    return res.json({
+      ok: true,
+      message: 'Encrypted key backup stored successfully',
+    });
+  } catch (err) {
+    console.error('Failed to update encrypted backup:', err.message);
+    return res.status(500).json({ error: 'Failed to store encrypted backup' });
+  }
+});
+
 module.exports = router;

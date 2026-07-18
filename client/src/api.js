@@ -242,3 +242,26 @@ export async function getUserPublicKey(userId) {
   return data;
 }
 
+/** Fetch full user profile including encrypted backup (used for multi-device recovery). */
+export async function fetchUserProfile() {
+  const res = await fetch(`${API}/users/me/profile`, {
+    headers: headers(),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to load user profile');
+  return data;
+}
+
+/** Upload encrypted private key backup for multi-device recovery. */
+export async function uploadEncryptedKeyBackup(backup) {
+  const res = await fetch(`${API}/users/me/encrypted-key-backup`, {
+    method: 'PUT',
+    headers: headers(),
+    body: JSON.stringify(backup),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to upload encrypted key backup');
+  return data;
+}
+
+
