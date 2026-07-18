@@ -2,7 +2,6 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { getSocket } from './socket';
 import * as api from './api';
 import { useE2EE } from './hooks/useE2EE';
-import { deletePrivateKey } from './utils/keyStorage';
 import Avatar from './Avatar';
 import GroupAvatar from './GroupAvatar';
 import { useVoiceCall } from './useVoiceCall';
@@ -405,7 +404,6 @@ useEffect(() => {
   const {
     isDirectE2EEReady,
     keyError: e2eeKeyError,
-    initializeKeys: reinitializeKeys,
     sendEncryptedMessage,
     decryptChatMessage,
     decryptMessageList,
@@ -503,32 +501,6 @@ useEffect(() => {
     sock.on('receive_message', onReceive);
     return () => sock.off('receive_message', onReceive);
   }, [selectedId, isGroup, peerPublicKey, other?.id, user.id, decryptChatMessage, loadConversations]);
-
-  const hasUndecryptableMessages = !isGroup && messages.some(
-    (m) => m.content === '[Unable to decrypt message]'
-  );
-
-  const handleResetEncryptionKeys = async () => {
-    if (!window.confirm(
-      'Reset your encryption keys? Old encrypted messages will stay unreadable until both users reset and send new messages.'
-    )) return;
-    try {
-      await deletePrivateKey(user.id);
-      await reinitializeKeys();
-      if (other?.id) {
-        const data = await api.getUserPublicKey(other.id);
-        setPeerPublicKey(data.publicKey);
-      }
-      if (selectedId) {
-        const conv = await api.getConversation(selectedId);
-        setMessages(conv.messages || []);
-      }
-      setSendError('');
-      setPeerKeyError('');
-    } catch (err) {
-      setSendError(err?.message || 'Failed to reset encryption keys');
-    }
-  };
 
   const handleSend = async (e) => {
     if (e) e.preventDefault();
@@ -1019,20 +991,6 @@ useEffect(() => {
             )}
             {!isGroup && peerKeyError && (
               <div className="chat-action-error" role="alert">{peerKeyError}</div>
-            )}
-            {!isGroup && hasUndecryptableMessages && (
-              <div className="chat-action-error" role="alert">
-                Some messages cannot be decrypted — keys are out of sync.
-                Both users must reset keys (button below) and send new messages.
-                <button
-                  type="button"
-                  className="btn-secondary btn-sm"
-                  style={{ marginLeft: 8 }}
-                  onClick={handleResetEncryptionKeys}
-                >
-                  Reset my keys
-                </button>
-              </div>
             )}
             {showGroupSettings && isGroup && (
               <div className="group-settings-backdrop" onClick={() => setShowGroupSettings(false)}>
