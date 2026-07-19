@@ -11,7 +11,6 @@ export default function Register({ onRegister, onSwitch, error, setError }) {
     setError('');
     try {
       const { user, token } = await api.register(username, password, displayName || username);
-      // Pass password to onRegister so it can be used for encrypted key backup creation
       onRegister(user, token, password);
     } catch (err) {
       setError(err.message || 'Registration failed');

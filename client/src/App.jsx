@@ -4,56 +4,10 @@ import * as api from './api';
 import Login from './Login';
 import Register from './Register';
 import Chat from './Chat';
-import { initializeUserKeys, recoverKeysFromBackup, generateFreshKeysAfterSkip } from './utils/authKeyHandler';
+import { initializeUserKeys } from './utils/authKeyHandler';
 
 const TOKEN_KEY = 'chat_token';
 const USER_KEY = 'chat_user';
-
-function KeyRecoveryModal({ userId, passwordHint, onRecover, onSkip, onError }) {
-  const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const handleRecover = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      await recoverKeysFromBackup(userId, password);
-      onRecover();
-    } catch (err) {
-      setError(err?.message || 'Recovery failed');
-      onError(err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="modal-overlay">
-      <div className="modal-content">
-        <h2>Recover Encryption Keys</h2>
-        <p>{passwordHint}</p>
-        {error && <div className="auth-error">{error}</div>}
-        <input
-          type="password"
-          placeholder="Enter your account password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          disabled={loading}
-          onKeyPress={(e) => e.key === 'Enter' && handleRecover()}
-        />
-        <div className="modal-actions">
-          <button onClick={handleRecover} disabled={loading || !password}>
-            {loading ? 'Recovering...' : 'Recover Keys'}
-          </button>
-          <button onClick={onSkip} disabled={loading} style={{ opacity: 0.6 }}>
-            Create new keys (old messages unreadable)
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 function App() {
   const [user, setUser] = useState(null);
@@ -61,57 +15,16 @@ function App() {
   const [authMode, setAuthMode] = useState('login');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [keyRecoveryModal, setKeyRecoveryModal] = useState(null);
   const pendingPasswordRef = useRef(null);
 
-  const finishKeyInit = () => {
-    window.dispatchEvent(new Event('e2ee-keys-restored'));
-  };
-
-  const initializeKeys = async (userId, password = null) => {
+  const setupEncryption = async (userId, password = null) => {
     try {
-      const result = await Promise.race([
-        initializeUserKeys(userId, { password }),
-        new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('Encryption setup timed out')), 15000);
-        }),
-      ]);
-
-      if (result.status === 'NEEDS_BACKUP_RESTORE') {
-        setKeyRecoveryModal({
-          userId,
-          hasBackup: result.hasBackup,
-          message: result.message,
-        });
-        return;
-      }
-
-      finishKeyInit();
-      console.log('[E2EE] Key initialization successful:', result);
+      await initializeUserKeys(userId, { password });
+      window.dispatchEvent(new Event('e2ee-keys-ready'));
     } catch (err) {
-      console.error('[E2EE] Key initialization failed:', err);
-      finishKeyInit();
+      console.error('[E2EE] Setup failed:', err);
+      window.dispatchEvent(new Event('e2ee-keys-ready'));
     }
-  };
-
-  const handleKeyRecoveryComplete = () => {
-    setKeyRecoveryModal(null);
-    finishKeyInit();
-  };
-
-  const handleKeyRecoverySkip = async () => {
-    if (keyRecoveryModal?.userId) {
-      try {
-        await generateFreshKeysAfterSkip(
-          keyRecoveryModal.userId,
-          pendingPasswordRef.current
-        );
-      } catch (err) {
-        console.error('[E2EE] Failed to create new keys:', err);
-      }
-    }
-    setKeyRecoveryModal(null);
-    finishKeyInit();
   };
 
   useEffect(() => {
@@ -125,7 +38,7 @@ function App() {
       .then(async (u) => {
         setUser(u);
         localStorage.setItem(USER_KEY, JSON.stringify(u));
-        await initializeKeys(u.id, pendingPasswordRef.current);
+        await setupEncryption(u.id, pendingPasswordRef.current);
         pendingPasswordRef.current = null;
       })
       .catch((err) => {
@@ -166,7 +79,6 @@ function App() {
     setUser(null);
     setError('');
     disconnectSocket();
-    setKeyRecoveryModal(null);
     pendingPasswordRef.current = null;
   };
 
@@ -200,20 +112,6 @@ function App() {
           />
         )}
       </div>
-    );
-  }
-
-  if (keyRecoveryModal) {
-    return (
-      <>
-        <KeyRecoveryModal
-          userId={keyRecoveryModal.userId}
-          passwordHint={keyRecoveryModal.message}
-          onRecover={handleKeyRecoveryComplete}
-          onSkip={handleKeyRecoverySkip}
-          onError={(err) => console.error('[E2EE] Key recovery error:', err)}
-        />
-      </>
     );
   }
 
