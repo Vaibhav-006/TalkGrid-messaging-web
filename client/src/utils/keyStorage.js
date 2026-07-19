@@ -12,6 +12,32 @@
 const DB_NAME = 'talkgrid_e2ee_keys';
 const DB_VERSION = 1;
 const STORE_NAME = 'privateKeys';
+const KEY_FLAG_PREFIX = 'talkgrid_e2ee_v1_';
+
+function normalizeUserId(userId) {
+  const n = Number(userId);
+  return Number.isFinite(n) ? String(n) : String(userId);
+}
+
+function keyFlagName(userId) {
+  return `${KEY_FLAG_PREFIX}${normalizeUserId(userId)}`;
+}
+
+export function markKeyStored(userId) {
+  try {
+    localStorage.setItem(keyFlagName(userId), '1');
+  } catch {
+    // ignore quota / privacy mode
+  }
+}
+
+export function hasKeyStoredFlag(userId) {
+  try {
+    return localStorage.getItem(keyFlagName(userId)) === '1';
+  } catch {
+    return false;
+  }
+}
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -30,11 +56,11 @@ function openDb() {
 }
 
 function storageKey(userId) {
-  return `priv_${String(userId)}`;
+  return `priv_${normalizeUserId(userId)}`;
 }
 
 function publicStorageKey(userId) {
-  return `pub_${String(userId)}`;
+  return `pub_${normalizeUserId(userId)}`;
 }
 
 /**
@@ -59,6 +85,7 @@ export async function savePrivateKey(userId, privateKey) {
     };
     tx.objectStore(STORE_NAME).put(privateKey, storageKey(userId));
   });
+  markKeyStored(userId);
 }
 
 /**
@@ -134,6 +161,11 @@ export async function getPrivateKey(userId) {
  */
 export async function deletePrivateKey(userId) {
   if (!userId) return;
+  try {
+    localStorage.removeItem(keyFlagName(userId));
+  } catch {
+    // ignore
+  }
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');

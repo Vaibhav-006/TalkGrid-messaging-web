@@ -70,11 +70,23 @@ function App() {
 
   const initializeKeys = async (userId, password = null) => {
     setE2eeReady(false);
+    const timeoutMs = 12000;
     try {
-      const result = await initializeUserKeys(userId, { password });
+      const result = await Promise.race([
+        initializeUserKeys(userId, { password }),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('Encryption setup timed out')), timeoutMs);
+        }),
+      ]);
 
       if (result.status === 'NEEDS_BACKUP_RESTORE') {
-        setKeyRecoveryModal(userId);
+        if (result.hasBackup) {
+          setKeyRecoveryModal(userId);
+        } else {
+          await generateFreshKeysAfterSkip(userId);
+          setE2eeReady(true);
+          window.dispatchEvent(new Event('e2ee-keys-restored'));
+        }
         return;
       }
 
@@ -83,12 +95,14 @@ function App() {
     } catch (err) {
       console.error('[E2EE] Key initialization failed:', err);
       setError('Encryption setup failed: ' + err.message);
+      setE2eeReady(true);
     }
   };
 
   const handleKeyRecoveryComplete = () => {
     setKeyRecoveryModal(null);
     setE2eeReady(true);
+    window.dispatchEvent(new Event('e2ee-keys-restored'));
   };
 
   const handleKeyRecoverySkip = async () => {
@@ -96,8 +110,10 @@ function App() {
       try {
         await generateFreshKeysAfterSkip(keyRecoveryModal);
         setE2eeReady(true);
+        window.dispatchEvent(new Event('e2ee-keys-restored'));
       } catch (err) {
         console.error('[E2EE] Failed to create new keys after skip:', err);
+        setE2eeReady(true);
       }
     }
     setKeyRecoveryModal(null);

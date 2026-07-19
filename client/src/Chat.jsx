@@ -402,11 +402,13 @@ useEffect(() => {
 
   const socket = getSocket();
   const {
+    keysReady,
     isDirectE2EEReady,
     keyError: e2eeKeyError,
     sendEncryptedMessage,
     decryptChatMessage,
     decryptMessageList,
+    loadKeys,
   } = useE2EE({
     userId: user.id,
     socket,
@@ -437,12 +439,11 @@ useEffect(() => {
   }, [other?.id, isGroup, selectedId]);
 
   useEffect(() => {
-    if (!selectedId || isGroup || !peerPublicKey) return;
+    if (!selectedId || isGroup || !peerPublicKey || !keysReady) return;
     let cancelled = false;
     (async () => {
       const needsDecrypt = messages.some(
-        (m) => (m.ciphertext || m.encrypted)
-          && (m.content === '🔒 Encrypted message' || m.content === '[Unable to decrypt message]')
+        (m) => (m.ciphertext || m.encrypted) && m.content === '🔒 Encrypted message'
       );
       if (!needsDecrypt) return;
       try {
@@ -453,7 +454,7 @@ useEffect(() => {
       }
     })();
     return () => { cancelled = true; };
-  }, [selectedId, isGroup, peerPublicKey, messages, decryptMessageList]);
+  }, [selectedId, isGroup, peerPublicKey, keysReady, messages, decryptMessageList]);
 
   useEffect(() => {
     const sock = getSocket();

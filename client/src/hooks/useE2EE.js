@@ -60,6 +60,9 @@ export function useE2EE({ userId, peerId, peerPublicKey }) {
 
   useEffect(() => {
     loadKeys();
+    const onKeysRestored = () => loadKeys();
+    window.addEventListener('e2ee-keys-restored', onKeysRestored);
+    return () => window.removeEventListener('e2ee-keys-restored', onKeysRestored);
   }, [loadKeys]);
 
   useEffect(() => {

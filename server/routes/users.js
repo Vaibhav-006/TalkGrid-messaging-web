@@ -113,9 +113,10 @@ router.get('/me/profile', async (req, res) => {
     }
   }
 
-  // Fallback to SQLite (limited backup info)
+  // Fallback to SQLite (includes encrypted backup when stored)
   const row = db.prepare(`
-    SELECT id, username, display_name, avatar_color, public_key
+    SELECT id, username, display_name, avatar_color, public_key,
+           encrypted_private_key_backup, encrypted_private_key_iv, encrypted_private_key_salt
     FROM users
     WHERE id = ?
   `).get(userId);
@@ -130,9 +131,9 @@ router.get('/me/profile', async (req, res) => {
     displayName: row.display_name ?? row.DISPLAY_NAME,
     avatarColor: row.avatar_color ?? row.AVATAR_COLOR,
     publicKey: row.public_key ?? row.PUBLIC_KEY ?? null,
-    encryptedPrivateKeyBackup: null, // SQLite does not store encrypted backups
-    encryptedPrivateKeyIV: null,
-    encryptedPrivateKeySalt: null,
+    encryptedPrivateKeyBackup: row.encrypted_private_key_backup ?? row.ENCRYPTED_PRIVATE_KEY_BACKUP ?? null,
+    encryptedPrivateKeyIV: row.encrypted_private_key_iv ?? row.ENCRYPTED_PRIVATE_KEY_IV ?? null,
+    encryptedPrivateKeySalt: row.encrypted_private_key_salt ?? row.ENCRYPTED_PRIVATE_KEY_SALT ?? null,
     encryptedBackupUpdatedAt: null,
   });
 });
@@ -160,12 +161,30 @@ router.put('/me/encrypted-key-backup', async (req, res) => {
     });
   }
 
-  if (!isMongoConnected() || !MongoUser) {
-    return res.status(503).json({ error: 'MongoDB not available for backup storage' });
+  try {
+    db.prepare(`
+      UPDATE users
+      SET encrypted_private_key_backup = ?, encrypted_private_key_iv = ?, encrypted_private_key_salt = ?
+      WHERE id = ?
+    `).run(encryptedPrivateKey, iv, salt, req.user.id);
+  } catch (err) {
+    try {
+      db.prepare('ALTER TABLE users ADD COLUMN encrypted_private_key_backup TEXT').run();
+      db.prepare('ALTER TABLE users ADD COLUMN encrypted_private_key_iv TEXT').run();
+      db.prepare('ALTER TABLE users ADD COLUMN encrypted_private_key_salt TEXT').run();
+      db.prepare(`
+        UPDATE users
+        SET encrypted_private_key_backup = ?, encrypted_private_key_iv = ?, encrypted_private_key_salt = ?
+        WHERE id = ?
+      `).run(encryptedPrivateKey, iv, salt, req.user.id);
+    } catch (migrateErr) {
+      console.error('encrypted backup column migration failed:', migrateErr.message);
+      return res.status(500).json({ error: 'Failed to store encrypted backup' });
+    }
   }
 
-  try {
-    const updated = await MongoUser.findOneAndUpdate(
+  if (isMongoConnected() && MongoUser) {
+    MongoUser.findOneAndUpdate(
       { sqlId: req.user.id },
       {
         encryptedPrivateKeyBackup: encryptedPrivateKey,
@@ -173,21 +192,16 @@ router.put('/me/encrypted-key-backup', async (req, res) => {
         encryptedPrivateKeySalt: salt,
         encryptedBackupUpdatedAt: new Date(),
       },
-      { upsert: false, new: true }
-    );
-
-    if (!updated) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    return res.json({
-      ok: true,
-      message: 'Encrypted key backup stored successfully',
+      { upsert: false }
+    ).catch((err) => {
+      console.error('Mongo encrypted backup update failed:', err.message);
     });
-  } catch (err) {
-    console.error('Failed to update encrypted backup:', err.message);
-    return res.status(500).json({ error: 'Failed to store encrypted backup' });
   }
+
+  return res.json({
+    ok: true,
+    message: 'Encrypted key backup stored successfully',
+  });
 });
 
 module.exports = router;

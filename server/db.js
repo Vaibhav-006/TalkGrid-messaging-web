@@ -134,6 +134,15 @@ try {
   try {
     db.run('ALTER TABLE messages ADD COLUMN receiver_id INTEGER');
   } catch (_) {}
+  try {
+    db.run('ALTER TABLE users ADD COLUMN encrypted_private_key_backup TEXT');
+  } catch (_) {}
+  try {
+    db.run('ALTER TABLE users ADD COLUMN encrypted_private_key_iv TEXT');
+  } catch (_) {}
+  try {
+    db.run('ALTER TABLE users ADD COLUMN encrypted_private_key_salt TEXT');
+  } catch (_) {}
 
   // Ensure each existing group has at least one admin (earliest joined member)
   const groupRows = [];

@@ -13,6 +13,7 @@ import {
   getPublicKey,
   savePublicKey,
   saveEncryptedPrivateKeyBackup,
+  hasKeyStoredFlag,
 } from './keyStorage';
 import { fetchUserProfile, uploadPublicKey, uploadEncryptedKeyBackup } from '../api';
 
@@ -140,7 +141,9 @@ export async function initializeUserKeys(userId, options = {}) {
     }
 
     console.log('[E2EE] Existing private key found in IndexedDB — reusing for history integrity.');
-    await syncPublicKeyIfMissing(localPublicKey);
+    syncPublicKeyIfMissing(localPublicKey).catch((err) => {
+      console.warn('[E2EE] Background public key sync failed:', err);
+    });
     return {
       status: 'SUCCESS',
       action: 'KEYS_REUSED',
@@ -150,6 +153,9 @@ export async function initializeUserKeys(userId, options = {}) {
 
   // STEP 2: No local private key — check backend for recovery or new-user flow.
   console.log('[E2EE] No local private key — fetching user profile from backend...');
+  if (hasKeyStoredFlag(userId)) {
+    console.warn('[E2EE] Key flag found in localStorage but IndexedDB is empty — browser storage may have been cleared.');
+  }
   let userProfile;
   try {
     userProfile = await fetchUserProfile();
@@ -196,7 +202,7 @@ export async function initializeUserKeys(userId, options = {}) {
       action: 'MANUAL_KEY_RECOVERY_NEEDED',
       requiresPassword: false,
       hasBackup: false,
-      message: 'Your account has encryption keys on another device without an encrypted backup.',
+      message: 'Encryption keys not found in this browser.',
     };
   }
 
@@ -207,6 +213,12 @@ export async function initializeUserKeys(userId, options = {}) {
 
   await savePrivateKey(userId, newPrivate);
   await savePublicKey(userId, publicKeyBase64);
+
+  const persisted = await getPrivateKey(userId);
+  if (!persisted) {
+    throw new Error('Failed to persist encryption keys in this browser');
+  }
+
   await uploadPublicKey(publicKeyBase64);
 
   if (password && privateKeyPkcs8) {
@@ -273,6 +285,11 @@ export async function recoverKeysFromBackup(userId, password, profileOverride = 
   await savePrivateKey(userId, recoveredPrivateKey);
   await savePublicKey(userId, publicKeyBase64);
 
+  const persisted = await getPrivateKey(userId);
+  if (!persisted) {
+    throw new Error('Failed to persist recovered keys in this browser');
+  }
+
   console.log('[E2EE] Keys recovered and restored to IndexedDB.');
   return {
     status: 'SUCCESS',
@@ -295,6 +312,12 @@ export async function generateFreshKeysAfterSkip(userId) {
 
   await savePrivateKey(userId, newPrivate);
   await savePublicKey(userId, publicKeyBase64);
+
+  const persisted = await getPrivateKey(userId);
+  if (!persisted) {
+    throw new Error('Failed to persist encryption keys in this browser');
+  }
+
   await uploadPublicKey(publicKeyBase64);
 
   return {
