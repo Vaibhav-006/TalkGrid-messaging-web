@@ -1,63 +1,69 @@
-const db = require('./db');
+const { Conversation, User, formatUser } = require('./mongo');
 
-function rowId(row) {
-  if (!row) return null;
-  const v = row.id !== undefined ? row.id : row.ID;
-  if (typeof v === 'number' && !Number.isNaN(v)) return v;
-  if (typeof v === 'string') return parseInt(v, 10);
-  return null;
-}
-
-function formatUser(row) {
-  if (!row) return null;
-  return {
-    id: rowId(row),
-    username: row.username ?? row.USERNAME ?? '',
-    display_name: row.display_name ?? row.DISPLAY_NAME ?? null,
-    avatar_color: row.avatar_color ?? row.AVATAR_COLOR ?? null,
-  };
-}
-
-function getMemberIds(conversationId) {
-  return db
-    .prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ?')
-    .all(conversationId)
-    .map((r) => Number(r.user_id ?? r.USER_ID))
-    .filter((id) => !Number.isNaN(id) && id > 0);
+async function getMemberIds(conversationId) {
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  if (!conv?.members) return [];
+  return conv.members.map((m) => Number(m.userId)).filter((id) => !Number.isNaN(id) && id > 0);
 }
 
 function emitToConversationMembers(io, conversationId, event, payload) {
   if (!io) return;
-  for (const id of getMemberIds(conversationId)) {
-    io.to(`user:${String(id)}`).emit(event, payload);
-  }
+  getMemberIds(conversationId).then((ids) => {
+    for (const id of ids) {
+      io.to(`user:${String(id)}`).emit(event, payload);
+    }
+  }).catch((err) => console.error('emitToConversationMembers:', err.message));
 }
 
-function getMemberRole(conversationId, userId) {
-  const row = db
-    .prepare('SELECT role FROM conversation_members WHERE conversation_id = ? AND user_id = ?')
-    .get(conversationId, userId);
-  if (!row) return null;
-  return row.role ?? row.ROLE ?? 'member';
+async function getMemberRole(conversationId, userId) {
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  if (!conv) return null;
+  const member = conv.members?.find((m) => Number(m.userId) === Number(userId));
+  return member?.role ?? null;
 }
 
-function isGroupAdmin(conversationId, userId) {
-  return getMemberRole(conversationId, userId) === 'admin';
+async function isGroupAdmin(conversationId, userId) {
+  return (await getMemberRole(conversationId, userId)) === 'admin';
 }
 
-function isGroupConversation(conversationId) {
-  const row = db.prepare('SELECT is_group FROM conversations WHERE id = ?').get(conversationId);
-  if (!row) return false;
-  const flag = row.is_group ?? row.IS_GROUP;
-  return Number(flag) === 1;
+async function isGroupConversation(conversationId) {
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  return !!conv?.isGroup;
+}
+
+async function isConversationMember(conversationId, userId) {
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  if (!conv) return false;
+  return conv.members?.some((m) => Number(m.userId) === Number(userId));
+}
+
+async function findDirectConversation(userIdA, userIdB) {
+  const a = Number(userIdA);
+  const b = Number(userIdB);
+  return Conversation.findOne({
+    isGroup: false,
+    $and: [
+      { members: { $elemMatch: { userId: a } } },
+      { members: { $elemMatch: { userId: b } } },
+      { $expr: { $eq: [{ $size: '$members' }, 2] } },
+    ],
+  }).lean();
+}
+
+async function populateMemberUsers(memberIds) {
+  const users = await User.find({ sqlId: { $in: memberIds } }).lean();
+  const map = new Map(users.map((u) => [u.sqlId, formatUser(u)]));
+  return map;
 }
 
 module.exports = {
-  rowId,
   formatUser,
   getMemberIds,
   getMemberRole,
   isGroupAdmin,
   emitToConversationMembers,
   isGroupConversation,
+  isConversationMember,
+  findDirectConversation,
+  populateMemberUsers,
 };

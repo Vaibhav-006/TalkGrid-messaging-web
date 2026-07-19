@@ -1,12 +1,7 @@
-const db = require('./db');
-const { saveMessageToMongo } = require('./mongo');
+const { Message, nextMessageId } = require('./mongo');
+const { isConversationMember } = require('./conversationUtils');
+const { ENCRYPTED_PREVIEW } = require('./models/Message');
 
-const ENCRYPTED_PREVIEW = '🔒 Encrypted message';
-
-/**
- * Persist and broadcast an E2EE message. Used by Socket.io and REST.
- * @returns {Promise<object>} outbound payload for clients
- */
 async function saveAndBroadcastEncryptedMessage(io, {
   senderId,
   receiverId,
@@ -19,17 +14,13 @@ async function saveAndBroadcastEncryptedMessage(io, {
 
   if (conversationId != null && !Number.isNaN(conversationId)) {
     const convId = Number(conversationId);
-    const member = db.prepare(
-      'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-    ).get(convId, sid);
-    if (!member) {
+    const senderMember = await isConversationMember(convId, sid);
+    if (!senderMember) {
       const err = new Error('Not a member of this conversation');
       err.status = 403;
       throw err;
     }
-    const receiverMember = db.prepare(
-      'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-    ).get(convId, rid);
+    const receiverMember = await isConversationMember(convId, rid);
     if (!receiverMember) {
       const err = new Error('Receiver is not in this conversation');
       err.status = 403;
@@ -37,25 +28,24 @@ async function saveAndBroadcastEncryptedMessage(io, {
     }
   }
 
-  let sqliteId = null;
-  let createdAt = new Date().toISOString();
   const convIdNum = conversationId != null ? Number(conversationId) : null;
+  const messageSqlId = await nextMessageId();
+  const createdAt = new Date();
 
   if (convIdNum != null && !Number.isNaN(convIdNum)) {
-    db.prepare(`
-      INSERT INTO messages (conversation_id, sender_id, receiver_id, content, ciphertext, iv)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(convIdNum, sid, rid, ENCRYPTED_PREVIEW, ciphertext, iv);
-
-    const row = db.prepare(`
-      SELECT id, created_at FROM messages WHERE id = (SELECT last_insert_rowid())
-    `).get();
-    sqliteId = row?.id ?? row?.ID ?? null;
-    createdAt = row?.created_at ?? row?.CREATED_AT ?? createdAt;
+    await Message.create({
+      sqlId: messageSqlId,
+      conversationSqlId: convIdNum,
+      senderSqlId: sid,
+      receiverSqlId: rid,
+      content: ENCRYPTED_PREVIEW,
+      ciphertext,
+      iv,
+    });
   }
 
   const outbound = {
-    id: sqliteId,
+    id: messageSqlId,
     senderId: sid,
     receiverId: rid,
     sender_id: sid,
@@ -73,16 +63,6 @@ async function saveAndBroadcastEncryptedMessage(io, {
     io.to(`user:${rid}`).emit('receive_message', outbound);
     io.to(`user:${sid}`).emit('receive_message', outbound);
   }
-
-  await saveMessageToMongo({
-    conversationSqlId: Number.isNaN(convIdNum) ? null : convIdNum,
-    senderSqlId: sid,
-    receiverSqlId: rid,
-    ciphertext,
-    iv,
-  }).catch((err) => {
-    console.error('[E2EE] MongoMessage create failed:', err.message);
-  });
 
   return outbound;
 }

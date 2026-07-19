@@ -1,207 +1,128 @@
 const express = require('express');
-const db = require('../db');
-const { MongoUser, isMongoConnected } = require('../mongo');
+const { User, findUserBySqlId, ensureMongoConnected } = require('../mongo');
 const { authMiddleware } = require('../auth');
 
 const router = express.Router();
 router.use(authMiddleware);
 
-// Search user by username (unique) - exclude current user.
-// If no ?q is provided, returns an empty list.
-router.get('/', (req, res) => {
-  const q = (req.query.q || '').trim().toLowerCase();
-  if (!q) {
-    return res.json([]);
-  }
-  const user = db.prepare(`
-    SELECT id, username, display_name, avatar_color
-    FROM users
-    WHERE id != ? AND username = ?
-  `).get(req.user.id, q);
-
-  if (!user) {
-    return res.json([]);
-  }
-  res.json([user]);
-});
-
-/**
- * Upload / update the authenticated user's ECDH public key (SPKI Base64).
- * Private keys are never accepted — only the public half for peer key exchange.
- */
-router.put('/me/public-key', async (req, res) => {
-  const publicKey = typeof req.body?.publicKey === 'string' ? req.body.publicKey.trim() : '';
-  if (!publicKey || publicKey.length < 32) {
-    return res.status(400).json({ error: 'Valid publicKey (Base64 SPKI) required' });
-  }
-
+router.get('/', async (req, res) => {
   try {
-    db.prepare('UPDATE users SET public_key = ? WHERE id = ?').run(publicKey, req.user.id);
+    await ensureMongoConnected();
+    const q = (req.query.q || '').trim().toLowerCase();
+    if (!q) return res.json([]);
+
+    const user = await User.findOne({
+      sqlId: { $ne: Number(req.user.id) },
+      username: q,
+    }).lean();
+
+    if (!user) return res.json([]);
+    res.json([{
+      id: user.sqlId,
+      username: user.username,
+      display_name: user.displayName ?? null,
+      avatar_color: user.avatarColor ?? '#25D366',
+    }]);
   } catch (err) {
-    try {
-      db.prepare('ALTER TABLE users ADD COLUMN public_key TEXT').run();
-      db.prepare('UPDATE users SET public_key = ? WHERE id = ?').run(publicKey, req.user.id);
-    } catch (migrateErr) {
-      console.error('public_key column migration failed:', migrateErr.message);
-      return res.status(500).json({ error: 'Failed to store public key' });
+    console.error('User search error:', err);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+router.put('/me/public-key', async (req, res) => {
+  try {
+    await ensureMongoConnected();
+    const publicKey = typeof req.body?.publicKey === 'string' ? req.body.publicKey.trim() : '';
+    if (!publicKey || publicKey.length < 32) {
+      return res.status(400).json({ error: 'Valid publicKey (Base64 SPKI) required' });
     }
-  }
 
-  if (isMongoConnected() && MongoUser) {
-    MongoUser.findOneAndUpdate(
-      { sqlId: req.user.id },
+    await User.findOneAndUpdate(
+      { sqlId: Number(req.user.id) },
       { publicKey },
-      { upsert: false }
-    ).catch((err) => {
-      console.error('Mongo User publicKey update failed:', err.message);
-    });
-  }
+      { new: true }
+    );
 
-  return res.json({ ok: true, publicKey });
+    return res.json({ ok: true, publicKey });
+  } catch (err) {
+    console.error('public-key upload error:', err);
+    return res.status(500).json({ error: 'Failed to store public key' });
+  }
 });
 
-/**
- * Fetch a user's public key for ECDH key agreement before encrypting a 1-on-1 message.
- */
 router.get('/:userId/public-key', async (req, res) => {
-  const targetId = parseInt(req.params.userId, 10);
-  if (!targetId || Number.isNaN(targetId)) {
-    return res.status(400).json({ error: 'Invalid user id' });
+  try {
+    await ensureMongoConnected();
+    const targetId = parseInt(req.params.userId, 10);
+    if (!targetId || Number.isNaN(targetId)) {
+      return res.status(400).json({ error: 'Invalid user id' });
+    }
+
+    const user = await User.findOne({ sqlId: targetId }).select('publicKey sqlId').lean();
+    if (!user?.publicKey) {
+      return res.status(404).json({ error: 'User has no public key yet' });
+    }
+
+    return res.json({ userId: targetId, publicKey: user.publicKey });
+  } catch (err) {
+    console.error('public-key fetch error:', err);
+    return res.status(500).json({ error: 'Failed to load public key' });
   }
-
-  let publicKey = null;
-
-  const row = db.prepare('SELECT id, public_key FROM users WHERE id = ?').get(targetId);
-  if (row) {
-    publicKey = row.public_key ?? row.PUBLIC_KEY ?? null;
-  }
-
-  if (!publicKey && isMongoConnected() && MongoUser) {
-    const mongoUser = await MongoUser.findOne({ sqlId: targetId }).select('publicKey').lean();
-    publicKey = mongoUser?.publicKey ?? null;
-  }
-
-  if (!publicKey) {
-    return res.status(404).json({ error: 'User has no public key yet' });
-  }
-
-  return res.json({ userId: targetId, publicKey });
 });
 
-/**
- * FIX 2: Fetch authenticated user's full profile including encrypted private key backup.
- * Used during multi-device recovery flow to retrieve encrypted backup.
- */
 router.get('/me/profile', async (req, res) => {
-  const userId = req.user.id;
+  try {
+    await ensureMongoConnected();
+    const user = await findUserBySqlId(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-  // Try MongoDB first (has all backup fields)
-  if (isMongoConnected() && MongoUser) {
-    const mongoUser = await MongoUser.findOne({ sqlId: userId }).lean();
-    if (mongoUser) {
-      return res.json({
-        userId: mongoUser.sqlId,
-        username: mongoUser.username,
-        displayName: mongoUser.displayName,
-        avatarColor: mongoUser.avatarColor,
-        publicKey: mongoUser.publicKey || null,
-        encryptedPrivateKeyBackup: mongoUser.encryptedPrivateKeyBackup || null,
-        encryptedPrivateKeyIV: mongoUser.encryptedPrivateKeyIV || null,
-        encryptedPrivateKeySalt: mongoUser.encryptedPrivateKeySalt || null,
-        encryptedBackupUpdatedAt: mongoUser.encryptedBackupUpdatedAt || null,
+    return res.json({
+      userId: user.sqlId,
+      username: user.username,
+      displayName: user.displayName,
+      avatarColor: user.avatarColor,
+      publicKey: user.publicKey || null,
+      encryptedPrivateKeyBackup: user.encryptedPrivateKeyBackup || null,
+      encryptedPrivateKeyIV: user.encryptedPrivateKeyIV || null,
+      encryptedPrivateKeySalt: user.encryptedPrivateKeySalt || null,
+      encryptedBackupUpdatedAt: user.encryptedBackupUpdatedAt || null,
+    });
+  } catch (err) {
+    console.error('profile fetch error:', err);
+    return res.status(500).json({ error: 'Failed to load profile' });
+  }
+});
+
+router.put('/me/encrypted-key-backup', async (req, res) => {
+  try {
+    await ensureMongoConnected();
+    const encryptedPrivateKey = typeof req.body?.encryptedPrivateKey === 'string'
+      ? req.body.encryptedPrivateKey.trim()
+      : '';
+    const iv = typeof req.body?.iv === 'string' ? req.body.iv.trim() : '';
+    const salt = typeof req.body?.salt === 'string' ? req.body.salt.trim() : '';
+
+    if (!encryptedPrivateKey || !iv || !salt) {
+      return res.status(400).json({
+        error: 'encryptedPrivateKey, iv, and salt (all Base64) required',
       });
     }
-  }
 
-  // Fallback to SQLite (includes encrypted backup when stored)
-  const row = db.prepare(`
-    SELECT id, username, display_name, avatar_color, public_key,
-           encrypted_private_key_backup, encrypted_private_key_iv, encrypted_private_key_salt
-    FROM users
-    WHERE id = ?
-  `).get(userId);
-
-  if (!row) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-
-  return res.json({
-    userId: row.id ?? row.ID,
-    username: row.username ?? row.USERNAME,
-    displayName: row.display_name ?? row.DISPLAY_NAME,
-    avatarColor: row.avatar_color ?? row.AVATAR_COLOR,
-    publicKey: row.public_key ?? row.PUBLIC_KEY ?? null,
-    encryptedPrivateKeyBackup: row.encrypted_private_key_backup ?? row.ENCRYPTED_PRIVATE_KEY_BACKUP ?? null,
-    encryptedPrivateKeyIV: row.encrypted_private_key_iv ?? row.ENCRYPTED_PRIVATE_KEY_IV ?? null,
-    encryptedPrivateKeySalt: row.encrypted_private_key_salt ?? row.ENCRYPTED_PRIVATE_KEY_SALT ?? null,
-    encryptedBackupUpdatedAt: null,
-  });
-});
-
-/**
- * FIX 2: Upload / update encrypted private key backup for multi-device recovery.
- * 
- * The backup contains:
- * - encryptedPrivateKey: Private key encrypted with user's password (PBKDF2 + AES-GCM)
- * - iv: IV used for encryption (Base64, 12 bytes)
- * - salt: PBKDF2 salt (Base64, typically 16 bytes)
- * 
- * Only stored on MongoDB (provides better structured data support).
- */
-router.put('/me/encrypted-key-backup', async (req, res) => {
-  const encryptedPrivateKey = typeof req.body?.encryptedPrivateKey === 'string'
-    ? req.body.encryptedPrivateKey.trim()
-    : '';
-  const iv = typeof req.body?.iv === 'string' ? req.body.iv.trim() : '';
-  const salt = typeof req.body?.salt === 'string' ? req.body.salt.trim() : '';
-
-  if (!encryptedPrivateKey || !iv || !salt) {
-    return res.status(400).json({
-      error: 'encryptedPrivateKey, iv, and salt (all Base64) required',
-    });
-  }
-
-  try {
-    db.prepare(`
-      UPDATE users
-      SET encrypted_private_key_backup = ?, encrypted_private_key_iv = ?, encrypted_private_key_salt = ?
-      WHERE id = ?
-    `).run(encryptedPrivateKey, iv, salt, req.user.id);
-  } catch (err) {
-    try {
-      db.prepare('ALTER TABLE users ADD COLUMN encrypted_private_key_backup TEXT').run();
-      db.prepare('ALTER TABLE users ADD COLUMN encrypted_private_key_iv TEXT').run();
-      db.prepare('ALTER TABLE users ADD COLUMN encrypted_private_key_salt TEXT').run();
-      db.prepare(`
-        UPDATE users
-        SET encrypted_private_key_backup = ?, encrypted_private_key_iv = ?, encrypted_private_key_salt = ?
-        WHERE id = ?
-      `).run(encryptedPrivateKey, iv, salt, req.user.id);
-    } catch (migrateErr) {
-      console.error('encrypted backup column migration failed:', migrateErr.message);
-      return res.status(500).json({ error: 'Failed to store encrypted backup' });
-    }
-  }
-
-  if (isMongoConnected() && MongoUser) {
-    MongoUser.findOneAndUpdate(
-      { sqlId: req.user.id },
+    await User.findOneAndUpdate(
+      { sqlId: Number(req.user.id) },
       {
         encryptedPrivateKeyBackup: encryptedPrivateKey,
         encryptedPrivateKeyIV: iv,
         encryptedPrivateKeySalt: salt,
         encryptedBackupUpdatedAt: new Date(),
-      },
-      { upsert: false }
-    ).catch((err) => {
-      console.error('Mongo encrypted backup update failed:', err.message);
-    });
-  }
+      }
+    );
 
-  return res.json({
-    ok: true,
-    message: 'Encrypted key backup stored successfully',
-  });
+    return res.json({ ok: true, message: 'Encrypted key backup stored successfully' });
+  } catch (err) {
+    console.error('backup upload error:', err);
+    return res.status(500).json({ error: 'Failed to store encrypted backup' });
+  }
 });
 
 module.exports = router;

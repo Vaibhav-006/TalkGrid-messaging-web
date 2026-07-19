@@ -1,26 +1,38 @@
 const mongoose = require('mongoose');
 
-/**
- * Encrypted direct message — server stores opaque ciphertext + IV only.
- * The server cannot decrypt; clients derive the AES-GCM key via ECDH locally.
- */
 const messageSchema = new mongoose.Schema(
   {
-    conversationSqlId: { type: Number, index: true },
-    /** Sender's SQLite user id */
+    sqlId: { type: Number, required: true, unique: true, index: true },
+    conversationSqlId: { type: Number, required: true, index: true },
     senderSqlId: { type: Number, required: true, index: true },
-    /** Receiver's SQLite user id (1-on-1 chats) */
-    receiverSqlId: { type: Number, index: true },
-    /** AES-GCM ciphertext, Base64 (E2EE payloads) */
-    ciphertext: { type: String, default: null },
-    /** 12-byte IV, Base64 (E2EE payloads) */
-    iv: { type: String, default: null },
-    /** Legacy plaintext field — used by non-E2EE REST messages */
+    receiverSqlId: { type: Number, default: null, index: true },
     content: { type: String, default: null },
+    ciphertext: { type: String, default: null },
+    iv: { type: String, default: null },
   },
   { timestamps: true }
 );
 
-const MongoMessage = mongoose.models.MongoMessage || mongoose.model('MongoMessage', messageSchema);
+messageSchema.index({ conversationSqlId: 1, createdAt: 1 });
 
-module.exports = { messageSchema, Message: MongoMessage, MongoMessage };
+const Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
+
+const ENCRYPTED_PREVIEW = '🔒 Encrypted message';
+
+function formatMessage(doc, sender = null) {
+  if (!doc) return null;
+  const ciphertext = doc.ciphertext || null;
+  return {
+    id: doc.sqlId,
+    sender_id: doc.senderSqlId,
+    receiver_id: doc.receiverSqlId ?? null,
+    content: ciphertext ? ENCRYPTED_PREVIEW : (doc.content ?? ''),
+    ciphertext,
+    iv: doc.iv ?? null,
+    encrypted: !!ciphertext,
+    created_at: doc.createdAt,
+    sender,
+  };
+}
+
+module.exports = { Message, messageSchema, formatMessage, ENCRYPTED_PREVIEW };

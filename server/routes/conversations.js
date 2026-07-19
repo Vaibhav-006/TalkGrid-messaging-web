@@ -1,133 +1,124 @@
 const express = require('express');
-const db = require('../db');
-const { MongoConversation, isMongoConnected } = require('../mongo');
+const {
+  Conversation,
+  Message,
+  User,
+  formatUser,
+  formatMessage,
+  nextConversationId,
+  findUserBySqlId,
+  ensureMongoConnected,
+} = require('../mongo');
 const { authMiddleware } = require('../auth');
 const {
-  rowId,
-  formatUser,
   getMemberIds,
   getMemberRole,
   isGroupAdmin,
   emitToConversationMembers,
   isGroupConversation,
+  isConversationMember,
+  findDirectConversation,
+  populateMemberUsers,
 } = require('../conversationUtils');
 
-function getOtherMember(conversationId, myId) {
-  const row = db.prepare(`
-    SELECT u.id, u.username, u.display_name, u.avatar_color
-    FROM conversation_members m
-    INNER JOIN users u ON u.id = m.user_id
-    WHERE m.conversation_id = ? AND m.user_id != ?
-  `).get(conversationId, myId);
-  return formatUser(row);
+async function getOtherMember(conversationId, myId) {
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  if (!conv || conv.isGroup) return null;
+  const otherId = conv.members?.find((m) => Number(m.userId) !== Number(myId))?.userId;
+  if (!otherId) return null;
+  const user = await findUserBySqlId(otherId);
+  return formatUser(user);
 }
 
-function getMembers(conversationId) {
-  const rows = db.prepare(`
-    SELECT u.id, u.username, u.display_name, u.avatar_color, m.role
-    FROM conversation_members m
-    INNER JOIN users u ON u.id = m.user_id
-    WHERE m.conversation_id = ?
-    ORDER BY CASE WHEN m.role = 'admin' THEN 0 ELSE 1 END, u.display_name, u.username
-  `).all(conversationId);
-  return rows.map((r) => {
-    const user = formatUser(r);
-    if (!user) return null;
-    return { ...user, role: r.role ?? r.ROLE ?? 'member' };
-  }).filter(Boolean);
+async function getMembers(conversationId) {
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  if (!conv?.members) return [];
+  const ids = conv.members.map((m) => m.userId);
+  const userMap = await populateMemberUsers(ids);
+  return conv.members
+    .map((m) => {
+      const user = userMap.get(m.userId);
+      if (!user) return null;
+      return { ...user, role: m.role ?? 'member' };
+    })
+    .filter(Boolean)
+    .sort((a, b) => {
+      if (a.role === 'admin' && b.role !== 'admin') return -1;
+      if (b.role === 'admin' && a.role !== 'admin') return 1;
+      return (a.display_name || a.username).localeCompare(b.display_name || b.username);
+    });
 }
 
-function getLastMessage(conversationId) {
-  const row = db.prepare(`
-    SELECT content, ciphertext, created_at FROM messages
-    WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1
-  `).get(conversationId);
-  if (!row) return null;
-  const ciphertext = row.ciphertext ?? row.CIPHERTEXT;
-  const content = row.content ?? row.CONTENT;
+async function getLastMessage(conversationId) {
+  const msg = await Message.findOne({ conversationSqlId: Number(conversationId) })
+    .sort({ createdAt: -1 })
+    .lean();
+  if (!msg) return null;
   return {
-    content: ciphertext ? '🔒 Encrypted message' : content,
-    created_at: row.created_at ?? row.CREATED_AT,
+    content: msg.ciphertext ? '🔒 Encrypted message' : (msg.content ?? ''),
+    created_at: msg.createdAt,
   };
 }
 
-function buildConversationSummary(conversationId, myId) {
-  const member = db.prepare(
-    'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-  ).get(conversationId, myId);
+async function buildConversationSummary(conversationId, myId) {
+  const member = await isConversationMember(conversationId, myId);
   if (!member) return null;
 
-  const convRow = db.prepare('SELECT id, is_group, name FROM conversations WHERE id = ?').get(conversationId);
-  if (!convRow) return null;
+  const conv = await Conversation.findOne({ sqlId: Number(conversationId) }).lean();
+  if (!conv) return null;
 
-  const isGroup = Number(convRow.is_group ?? convRow.IS_GROUP) === 1;
-  const last = getLastMessage(conversationId);
+  const last = await getLastMessage(conversationId);
   const base = {
     id: conversationId,
-    isGroup,
-    lastMessage: last ? (last.content ?? last.CONTENT ?? null) : null,
-    lastAt: last ? (last.created_at ?? last.CREATED_AT ?? null) : null,
+    isGroup: !!conv.isGroup,
+    lastMessage: last?.content ?? null,
+    lastAt: last?.created_at ?? null,
   };
 
-  if (isGroup) {
+  if (conv.isGroup) {
     return {
       ...base,
-      name: (convRow.name ?? convRow.NAME ?? 'Group').trim() || 'Group',
-      members: getMembers(conversationId),
-      myRole: getMemberRole(conversationId, myId),
+      name: (conv.name || 'Group').trim() || 'Group',
+      members: await getMembers(conversationId),
+      myRole: await getMemberRole(conversationId, myId),
     };
   }
 
-  const other = getOtherMember(conversationId, myId);
+  const other = await getOtherMember(conversationId, myId);
   if (!other) return null;
   return { ...base, otherUser: other };
 }
 
-function getConversationById(conversationId, myId) {
+async function getConversationById(conversationId, myId) {
   return buildConversationSummary(conversationId, myId);
 }
 
-function getMessages(conversationId) {
-  const rows = db.prepare(`
-    SELECT m.id, m.sender_id, m.receiver_id, m.content, m.ciphertext, m.iv, m.created_at,
-           u.username, u.display_name, u.avatar_color
-    FROM messages m
-    LEFT JOIN users u ON u.id = m.sender_id
-    WHERE m.conversation_id = ?
-    ORDER BY m.created_at ASC
-  `).all(conversationId);
+async function getMessages(conversationId) {
+  const rows = await Message.find({ conversationSqlId: Number(conversationId) })
+    .sort({ createdAt: 1 })
+    .lean();
 
-  return rows.map((r) => ({
-    id: r.id ?? r.ID,
-    sender_id: r.sender_id ?? r.SENDER_ID,
-    receiver_id: r.receiver_id ?? r.RECEIVER_ID ?? null,
-    content: r.content ?? r.CONTENT,
-    ciphertext: r.ciphertext ?? r.CIPHERTEXT ?? null,
-    iv: r.iv ?? r.IV ?? null,
-    encrypted: !!(r.ciphertext ?? r.CIPHERTEXT),
-    created_at: r.created_at ?? r.CREATED_AT,
-    sender: formatUser({
-      id: r.sender_id ?? r.SENDER_ID,
-      username: r.username ?? r.USERNAME,
-      display_name: r.display_name ?? r.DISPLAY_NAME,
-      avatar_color: r.avatar_color ?? r.AVATAR_COLOR,
-    }),
-  }));
+  const senderIds = [...new Set(rows.map((r) => r.senderSqlId))];
+  const userMap = await populateMemberUsers(senderIds);
+
+  return rows.map((r) => formatMessage(r, userMap.get(r.senderSqlId) ?? null));
 }
 
-function notifyGroupUpdate(io, convId) {
+async function notifyGroupUpdate(io, convId) {
   if (!io) return;
-  for (const uid of getMemberIds(convId)) {
-    const conv = getConversationById(convId, uid);
+  const ids = await getMemberIds(convId);
+  for (const uid of ids) {
+    const conv = await getConversationById(convId, uid);
     if (conv) {
       io.to(`user:${String(uid)}`).emit('group:updated', { conversationId: convId, conversation: conv });
     }
   }
 }
-function notifyNewConversation(io, convId, participantIds) {
+
+async function notifyNewConversation(io, convId, participantIds) {
   if (!io) return;
   for (const uid of participantIds) {
-    const conv = getConversationById(convId, uid);
+    const conv = await getConversationById(convId, uid);
     if (conv) {
       io.to(`user:${String(uid)}`).emit('conversation:new', conv);
     }
@@ -138,73 +129,47 @@ function createRouter(io) {
   const router = express.Router();
   router.use(authMiddleware);
 
-  router.post('/direct/:userId', (req, res) => {
+  router.post('/direct/:userId', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const myId = Number(req.user.id);
-      if (!req.user?.id || Number.isNaN(myId) || myId < 1) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
       const otherId = parseInt(req.params.userId, 10);
       if (Number.isNaN(otherId) || otherId < 1 || otherId === myId) {
         return res.status(400).json({ error: 'Invalid user' });
       }
-      const other = db.prepare('SELECT id FROM users WHERE id = ?').get(otherId);
+
+      const other = await findUserBySqlId(otherId);
       if (!other) return res.status(404).json({ error: 'User not found' });
 
-      const existing = db.prepare(`
-        SELECT c.id FROM conversations c
-        INNER JOIN conversation_members m1 ON m1.conversation_id = c.id AND m1.user_id = ?
-        INNER JOIN conversation_members m2 ON m2.conversation_id = c.id AND m2.user_id = ?
-        WHERE COALESCE(c.is_group, 0) = 0
-          AND (SELECT COUNT(*) FROM conversation_members WHERE conversation_id = c.id) = 2
-      `).get(myId, otherId);
-
-      const existingConvId = rowId(existing);
-      if (existingConvId) {
-        const conv = getConversationById(existingConvId, myId);
-        return res.json({ ...conv, messages: getMessages(existingConvId) });
+      const existing = await findDirectConversation(myId, otherId);
+      if (existing) {
+        const conv = await getConversationById(existing.sqlId, myId);
+        return res.json({ ...conv, messages: await getMessages(existing.sqlId) });
       }
 
-      db.prepare('INSERT INTO conversations (is_group) VALUES (0)').run();
-      const newRow = db.prepare('SELECT id FROM conversations ORDER BY id DESC LIMIT 1').get();
-      const convId = rowId(newRow);
-      if (!convId) {
-        return res.status(500).json({ error: 'Failed to create conversation' });
-      }
-      db.prepare(
-        'INSERT INTO conversation_members (conversation_id, user_id) VALUES (?, ?), (?, ?)'
-      ).run(convId, myId, convId, otherId);
+      const convId = await nextConversationId();
+      await Conversation.create({
+        sqlId: convId,
+        isGroup: false,
+        members: [
+          { userId: myId, role: 'member' },
+          { userId: otherId, role: 'member' },
+        ],
+      });
 
-      if (isMongoConnected() && MongoConversation) {
-        MongoConversation.findOneAndUpdate(
-          { sqlId: convId },
-          { sqlId: convId, participantsSqlIds: [myId, otherId], isGroup: false },
-          { upsert: true, setDefaultsOnInsert: true }
-        ).catch((err) => {
-          console.error('MongoConversation upsert failed:', err.message);
-        });
-      }
-
-      const conv = getConversationById(convId, myId);
-      if (!conv) {
-        return res.status(500).json({ error: 'Failed to load conversation' });
-      }
+      const conv = await getConversationById(convId, myId);
       notifyNewConversation(io, convId, [otherId]);
       return res.status(201).json({ ...conv, messages: [] });
     } catch (err) {
       console.error('POST /direct/:userId error:', err);
-      const msg = err && (err.message || String(err));
-      return res.status(500).json({ error: msg || 'Failed to create conversation' });
+      return res.status(500).json({ error: err.message || 'Failed to create conversation' });
     }
   });
 
-  router.post('/group', (req, res) => {
+  router.post('/group', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const myId = Number(req.user.id);
-      if (!req.user?.id || Number.isNaN(myId) || myId < 1) {
-        return res.status(401).json({ error: 'Unauthorized' });
-      }
-
       const name = String(req.body?.name || '').trim();
       if (!name || name.length > 100) {
         return res.status(400).json({ error: 'Group name is required (max 100 characters)' });
@@ -212,9 +177,7 @@ function createRouter(io) {
 
       const rawIds = Array.isArray(req.body?.memberIds) ? req.body.memberIds : [];
       const memberIds = [...new Set(
-        rawIds
-          .map((id) => parseInt(id, 10))
-          .filter((id) => !Number.isNaN(id) && id > 0 && id !== myId)
+        rawIds.map((id) => parseInt(id, 10)).filter((id) => !Number.isNaN(id) && id > 0 && id !== myId)
       )];
 
       if (memberIds.length < 1) {
@@ -222,249 +185,192 @@ function createRouter(io) {
       }
 
       for (const uid of memberIds) {
-        const exists = db.prepare('SELECT id FROM users WHERE id = ?').get(uid);
+        const exists = await findUserBySqlId(uid);
         if (!exists) return res.status(404).json({ error: `User ${uid} not found` });
       }
 
-      db.prepare('INSERT INTO conversations (is_group, name) VALUES (1, ?)').run(name);
-      const newRow = db.prepare('SELECT id FROM conversations ORDER BY id DESC LIMIT 1').get();
-      const convId = rowId(newRow);
-      if (!convId) {
-        return res.status(500).json({ error: 'Failed to create group' });
-      }
+      const convId = await nextConversationId();
+      const members = [{ userId: myId, role: 'admin' }, ...memberIds.map((id) => ({ userId: id, role: 'member' }))];
+      await Conversation.create({ sqlId: convId, isGroup: true, name, members });
 
-      const allMemberIds = [myId, ...memberIds];
-      const insertMember = db.prepare(
-        'INSERT INTO conversation_members (conversation_id, user_id, role) VALUES (?, ?, ?)'
-      );
-      insertMember.run(convId, myId, 'admin');
-      for (const uid of memberIds) {
-        insertMember.run(convId, uid, 'member');
-      }
-
-      if (isMongoConnected() && MongoConversation) {
-        MongoConversation.findOneAndUpdate(
-          { sqlId: convId },
-          { sqlId: convId, participantsSqlIds: allMemberIds, isGroup: true, name },
-          { upsert: true, setDefaultsOnInsert: true }
-        ).catch((err) => {
-          console.error('MongoConversation upsert failed:', err.message);
-        });
-      }
-
-      const conv = getConversationById(convId, myId);
-      if (!conv) {
-        return res.status(500).json({ error: 'Failed to load group' });
-      }
-
+      const conv = await getConversationById(convId, myId);
       notifyNewConversation(io, convId, memberIds);
       return res.status(201).json({ ...conv, messages: [] });
     } catch (err) {
       console.error('POST /group error:', err);
-      const msg = err && (err.message || String(err));
-      return res.status(500).json({ error: msg || 'Failed to create group' });
+      return res.status(500).json({ error: err.message || 'Failed to create group' });
     }
   });
 
-  router.get('/', (req, res) => {
-    const rows = db.prepare(`
-      SELECT c.id,
-             COALESCE(c.is_group, 0) as is_group,
-             c.name,
-             (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message,
-             (SELECT created_at FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_at
-      FROM conversations c
-      INNER JOIN conversation_members m ON m.conversation_id = c.id AND m.user_id = ?
-      ORDER BY last_at DESC
-    `).all(req.user.id);
+  router.get('/', async (req, res) => {
+    try {
+      await ensureMongoConnected();
+      const myId = Number(req.user.id);
+      const convs = await Conversation.find({ 'members.userId': myId }).lean();
 
-    const list = rows.map((r) => {
-      const cid = rowId(r);
-      if (!cid) return null;
-      const isGroup = Number(r.is_group ?? r.IS_GROUP) === 1;
-      const lastMessage = r.last_message ?? r.LAST_MESSAGE ?? null;
-      const lastAt = r.last_at ?? r.LAST_AT ?? null;
-
-      if (isGroup) {
-        return {
-          id: cid,
-          isGroup: true,
-          name: (r.name ?? r.NAME ?? 'Group').trim() || 'Group',
-          members: getMembers(cid),
-          myRole: getMemberRole(cid, req.user.id),
-          lastMessage,
-          lastAt,
+      const list = await Promise.all(convs.map(async (c) => {
+        const last = await getLastMessage(c.sqlId);
+        const base = {
+          id: c.sqlId,
+          isGroup: !!c.isGroup,
+          lastMessage: last?.content ?? null,
+          lastAt: last?.created_at ?? null,
         };
-      }
+        if (c.isGroup) {
+          return {
+            ...base,
+            name: (c.name || 'Group').trim() || 'Group',
+            members: await getMembers(c.sqlId),
+            myRole: await getMemberRole(c.sqlId, myId),
+          };
+        }
+        return { ...base, otherUser: await getOtherMember(c.sqlId, myId) };
+      }));
 
-      const other = getOtherMember(cid, req.user.id);
-      return {
-        id: cid,
-        isGroup: false,
-        otherUser: other,
-        lastMessage,
-        lastAt,
-      };
-    }).filter(Boolean);
+      list.sort((a, b) => {
+        const ta = a.lastAt ? new Date(a.lastAt).getTime() : 0;
+        const tb = b.lastAt ? new Date(b.lastAt).getTime() : 0;
+        return tb - ta;
+      });
 
-    res.json(list);
+      res.json(list.filter(Boolean));
+    } catch (err) {
+      console.error('GET /conversations error:', err);
+      res.status(500).json({ error: 'Failed to load conversations' });
+    }
   });
 
-  router.patch('/:id/members/:userId/admin', (req, res) => {
+  router.patch('/:id/members/:userId/admin', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const myId = Number(req.user.id);
       const convId = parseInt(req.params.id, 10);
       const targetId = parseInt(req.params.userId, 10);
-      if (Number.isNaN(convId) || Number.isNaN(targetId)) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      if (!isGroupConversation(convId)) {
+      if (!(await isGroupConversation(convId))) {
         return res.status(400).json({ error: 'Not a group conversation' });
       }
-      if (!isGroupAdmin(convId, myId)) {
+      if (!(await isGroupAdmin(convId, myId))) {
         return res.status(403).json({ error: 'Only admins can promote members' });
       }
-      const member = db.prepare(
-        'SELECT role FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-      ).get(convId, targetId);
+      const conv = await Conversation.findOne({ sqlId: convId });
+      const member = conv?.members?.find((m) => m.userId === targetId);
       if (!member) return res.status(404).json({ error: 'Member not found' });
-      if ((member.role ?? member.ROLE) === 'admin') {
+      if (member.role === 'admin') {
         return res.status(400).json({ error: 'User is already an admin' });
       }
-      db.prepare(
-        "UPDATE conversation_members SET role = 'admin' WHERE conversation_id = ? AND user_id = ?"
-      ).run(convId, targetId);
-      notifyGroupUpdate(io, convId);
-      const conv = getConversationById(convId, myId);
-      return res.json(conv);
+      member.role = 'admin';
+      await conv.save();
+      await notifyGroupUpdate(io, convId);
+      return res.json(await getConversationById(convId, myId));
     } catch (err) {
-      console.error('PATCH /:id/members/:userId/admin error:', err);
+      console.error('PATCH admin error:', err);
       return res.status(500).json({ error: err.message || 'Failed to promote member' });
     }
   });
 
-  router.delete('/:id/members/:userId', (req, res) => {
+  router.delete('/:id/members/:userId', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const myId = Number(req.user.id);
       const convId = parseInt(req.params.id, 10);
       const targetId = parseInt(req.params.userId, 10);
-      if (Number.isNaN(convId) || Number.isNaN(targetId)) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      if (!isGroupConversation(convId)) {
+      if (!(await isGroupConversation(convId))) {
         return res.status(400).json({ error: 'Not a group conversation' });
       }
-      if (!isGroupAdmin(convId, myId)) {
+      if (!(await isGroupAdmin(convId, myId))) {
         return res.status(403).json({ error: 'Only admins can remove members' });
       }
       if (targetId === myId) {
         return res.status(400).json({ error: 'Admins cannot remove themselves' });
       }
-      const member = db.prepare(
-        'SELECT role FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-      ).get(convId, targetId);
+      const conv = await Conversation.findOne({ sqlId: convId });
+      const member = conv?.members?.find((m) => m.userId === targetId);
       if (!member) return res.status(404).json({ error: 'Member not found' });
-      if ((member.role ?? member.ROLE) === 'admin') {
+      if (member.role === 'admin') {
         return res.status(400).json({ error: 'Cannot remove another admin' });
       }
-      db.prepare(
-        'DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-      ).run(convId, targetId);
+      conv.members = conv.members.filter((m) => m.userId !== targetId);
+      await conv.save();
       io.to(`user:${String(targetId)}`).emit('group:removed', { conversationId: convId });
-      notifyGroupUpdate(io, convId);
+      await notifyGroupUpdate(io, convId);
       return res.json({ ok: true });
     } catch (err) {
-      console.error('DELETE /:id/members/:userId error:', err);
+      console.error('DELETE member error:', err);
       return res.status(500).json({ error: err.message || 'Failed to remove member' });
     }
   });
 
-  router.delete('/:id/me', (req, res) => {
+  router.delete('/:id/me', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const myId = Number(req.user.id);
       const convId = parseInt(req.params.id, 10);
-      if (Number.isNaN(convId)) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-
-      const member = db.prepare(
-        'SELECT role FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-      ).get(convId, myId);
+      const conv = await Conversation.findOne({ sqlId: convId });
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+      const member = conv.members?.find((m) => m.userId === myId);
       if (!member) return res.status(404).json({ error: 'Conversation not found' });
 
-      const isGroup = isGroupConversation(convId);
-      if (isGroup) {
-        const role = member.role ?? member.ROLE;
-        if (role === 'admin') {
-          const otherAdmin = db.prepare(`
-            SELECT user_id FROM conversation_members
-            WHERE conversation_id = ? AND user_id != ? AND role = 'admin'
-          `).get(convId, myId);
-          if (!otherAdmin) {
-            return res.status(400).json({
-              error: 'Promote another admin before leaving, or delete the group from settings',
-            });
-          }
+      if (conv.isGroup && member.role === 'admin') {
+        const otherAdmin = conv.members.find((m) => m.userId !== myId && m.role === 'admin');
+        if (!otherAdmin) {
+          return res.status(400).json({
+            error: 'Promote another admin before leaving, or delete the group from settings',
+          });
         }
       }
 
-      db.prepare(
-        'DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?'
-      ).run(convId, myId);
-
-      const remaining = db.prepare(
-        'SELECT COUNT(*) as c FROM conversation_members WHERE conversation_id = ?'
-      ).get(convId);
-      const remainingCount = Number(remaining?.c ?? remaining?.C ?? 0);
-      if (remainingCount === 0) {
-        db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(convId);
-        db.prepare('DELETE FROM conversations WHERE id = ?').run(convId);
+      conv.members = conv.members.filter((m) => m.userId !== myId);
+      if (conv.members.length === 0) {
+        await Message.deleteMany({ conversationSqlId: convId });
+        await Conversation.deleteOne({ sqlId: convId });
+      } else {
+        await conv.save();
+        if (conv.isGroup) await notifyGroupUpdate(io, convId);
       }
 
       io.to(`user:${String(myId)}`).emit('conversation:deleted', { conversationId: convId });
-      if (isGroup && remainingCount > 0) {
-        notifyGroupUpdate(io, convId);
-      }
-
       return res.json({ ok: true });
     } catch (err) {
-      console.error('DELETE /:id/me error:', err);
+      console.error('DELETE /me error:', err);
       return res.status(500).json({ error: err.message || 'Failed to delete chat' });
     }
   });
 
-  router.delete('/:id', (req, res) => {
+  router.delete('/:id', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const myId = Number(req.user.id);
       const convId = parseInt(req.params.id, 10);
-      if (Number.isNaN(convId)) {
-        return res.status(400).json({ error: 'Invalid id' });
-      }
-      if (!isGroupConversation(convId)) {
+      if (!(await isGroupConversation(convId))) {
         return res.status(400).json({ error: 'Not a group conversation' });
       }
-      if (!isGroupAdmin(convId, myId)) {
+      if (!(await isGroupAdmin(convId, myId))) {
         return res.status(403).json({ error: 'Only admins can delete the group' });
       }
-      const memberIds = getMemberIds(convId);
-      db.prepare('DELETE FROM messages WHERE conversation_id = ?').run(convId);
-      db.prepare('DELETE FROM conversation_members WHERE conversation_id = ?').run(convId);
-      db.prepare('DELETE FROM conversations WHERE id = ?').run(convId);
+      const memberIds = await getMemberIds(convId);
+      await Message.deleteMany({ conversationSqlId: convId });
+      await Conversation.deleteOne({ sqlId: convId });
       for (const uid of memberIds) {
         io.to(`user:${String(uid)}`).emit('group:deleted', { conversationId: convId });
       }
       return res.json({ ok: true });
     } catch (err) {
-      console.error('DELETE /:id error:', err);
+      console.error('DELETE group error:', err);
       return res.status(500).json({ error: err.message || 'Failed to delete group' });
     }
   });
 
-  router.get('/:id', (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    const conv = getConversationById(id, req.user.id);
-    if (!conv) return res.status(404).json({ error: 'Conversation not found' });
-    res.json({ ...conv, messages: getMessages(id) });
+  router.get('/:id', async (req, res) => {
+    try {
+      await ensureMongoConnected();
+      const id = parseInt(req.params.id, 10);
+      const conv = await getConversationById(id, req.user.id);
+      if (!conv) return res.status(404).json({ error: 'Conversation not found' });
+      res.json({ ...conv, messages: await getMessages(id) });
+    } catch (err) {
+      console.error('GET conversation error:', err);
+      res.status(500).json({ error: 'Failed to load conversation' });
+    }
   });
 
   return router;

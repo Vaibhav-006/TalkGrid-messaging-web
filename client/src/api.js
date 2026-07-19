@@ -234,7 +234,7 @@ export async function uploadPublicKey(publicKey) {
   return data;
 }
 
-/** Fetch a user's ECDH public key by SQLite user id. */
+/** Fetch a user's ECDH public key by user id. */
 export async function getUserPublicKey(userId) {
   const res = await fetch(`${API}/users/${userId}/public-key`, { headers: headers() });
   const data = await res.json().catch(() => ({}));

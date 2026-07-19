@@ -1,22 +1,15 @@
 require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 
-// Must run before any Mongoose model is loaded — prevents 10s buffer timeouts without MONGODB_URI.
-if (!process.env.MONGODB_URI) {
-  require('mongoose').set('bufferCommands', false);
-}
-
 const http = require('http');
 const express = require('express');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const db = require('./db');
-const { connectMongo, saveMessageToMongo } = require('./mongo');
+const { connectMongo, Message, nextMessageId, findUserBySqlId, formatUser, ensureMongoConnected } = require('./mongo');
 const { verifyToken } = require('./auth');
 const registerVoiceHandlers = require('./voiceSignaling');
 const { registerChatSocketHandlers } = require('./socket/chatSocket');
-const { emitToConversationMembers } = require('./conversationUtils');
+const { emitToConversationMembers, isConversationMember } = require('./conversationUtils');
 
-/** userId -> number of active socket connections (tabs / devices) */
 const presenceCounts = new Map();
 
 function getOnlineUserIds() {
@@ -47,12 +40,7 @@ const io = new Server(server, {
   },
 });
 
-// Allow REST API from local dev and deployed frontend (e.g. Vercel).
-// In a real app you might tighten this to a specific Vercel URL via env.
-app.use(cors({
-  origin: (origin, cb) => cb(null, true),
-  credentials: true,
-}));
+app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }));
 app.use(express.json());
 
 app.get('/', (req, res) => {
@@ -60,14 +48,19 @@ app.get('/', (req, res) => {
 <html><head><title>TalkGrid API</title></head>
 <body style="font-family:system-ui,sans-serif;padding:2rem;max-width:32rem">
   <h1>TalkGrid API is running</h1>
-  <p>This port (<code>3001</code>) is the <strong>backend API only</strong> — not the chat UI.</p>
-  <p>Open the app here: <a href="http://localhost:5173"><strong>http://localhost:5173</strong></a></p>
+  <p>MongoDB backend — set <code>MONGODB_URI</code> in <code>server/.env</code></p>
+  <p>Chat UI: <a href="http://localhost:5173"><strong>http://localhost:5173</strong></a></p>
   <p><a href="/api/health">/api/health</a></p>
 </body></html>`);
 });
 
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, service: 'TalkGrid API' });
+app.get('/api/health', async (req, res) => {
+  try {
+    await ensureMongoConnected();
+    res.json({ ok: true, service: 'TalkGrid API', database: 'mongodb' });
+  } catch (err) {
+    res.status(503).json({ ok: false, error: err.message });
+  }
 });
 
 app.use('/api/auth', require('./routes/auth'));
@@ -75,7 +68,7 @@ app.use('/api/users', require('./routes/users'));
 app.use('/api/conversations', require('./routes/conversations')(io));
 app.use('/api/messages', require('./routes/messages')(io));
 app.use('/api/status', require('./routes/status'));
-// Socket.io: authenticate by token
+
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
   if (!token) return next(new Error('Auth required'));
@@ -100,32 +93,38 @@ io.on('connection', (socket) => {
   socket.emit('presence:snapshot', { onlineUserIds: getOnlineUserIds() });
 
   socket.join('user:' + String(uid));
-  registerVoiceHandlers(socket, io, db);
+  registerVoiceHandlers(socket, io);
   registerChatSocketHandlers(io, socket);
 
   socket.on('message:send', async ({ conversationId, content }) => {
-    if (!content?.trim()) return;
-    const convId = parseInt(conversationId, 10);
-    const member = db.prepare('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?').get(convId, socket.userId);
-    if (!member) return;
-    db.prepare('INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)').run(convId, socket.userId, content.trim());
-    const row = db.prepare('SELECT id, conversation_id, sender_id, content, created_at FROM messages WHERE id = last_insert_rowid()').get();
-    const senderRow = db.prepare('SELECT id, username, display_name, avatar_color FROM users WHERE id = ?').get(socket.userId);
-    const sender = senderRow ? {
-      id: senderRow.id ?? senderRow.ID,
-      username: senderRow.username ?? senderRow.USERNAME,
-      display_name: senderRow.display_name ?? senderRow.DISPLAY_NAME,
-      avatar_color: senderRow.avatar_color ?? senderRow.AVATAR_COLOR,
-    } : null;
-    const payload = { ...row, sender };
-    await saveMessageToMongo({
-      conversationSqlId: convId,
-      senderSqlId: socket.userId,
-      content: payload.content,
-    }).catch((err) => {
-      console.error('MongoMessage create failed:', err.message);
-    });
-    emitToConversationMembers(io, convId, 'message:new', payload);
+    try {
+      if (!content?.trim()) return;
+      await ensureMongoConnected();
+      const convId = parseInt(conversationId, 10);
+      if (!(await isConversationMember(convId, socket.userId))) return;
+
+      const messageSqlId = await nextMessageId();
+      const msg = await Message.create({
+        sqlId: messageSqlId,
+        conversationSqlId: convId,
+        senderSqlId: uid,
+        content: content.trim(),
+      });
+
+      const senderDoc = await findUserBySqlId(uid);
+      const payload = {
+        id: msg.sqlId,
+        conversation_id: convId,
+        sender_id: msg.senderSqlId,
+        content: msg.content,
+        created_at: msg.createdAt,
+        sender: formatUser(senderDoc),
+      };
+
+      emitToConversationMembers(io, convId, 'message:new', payload);
+    } catch (err) {
+      console.error('socket message:send error:', err.message);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -140,13 +139,21 @@ io.on('connection', (socket) => {
 });
 
 const PORT = Number(process.env.PORT) || 3001;
+
 (async () => {
-  await db.init();
-  await connectMongo().catch((err) => {
+  if (!process.env.MONGODB_URI) {
+    console.error('FATAL: MONGODB_URI is required in server/.env');
+    process.exit(1);
+  }
+  try {
+    await connectMongo();
+  } catch (err) {
     console.error('MongoDB connection failed:', err.message);
-  });
+    process.exit(1);
+  }
   server.listen(PORT, () => {
     console.log(`API server:  http://localhost:${PORT}`);
-    console.log(`Chat app:    http://localhost:5173  ← open this in your browser`);
+    console.log(`Chat app:    http://localhost:5173`);
+    console.log('Database:    MongoDB');
   });
 })();

@@ -76,12 +76,30 @@ export function useE2EE({ userId, peerId, peerPublicKey }) {
     if (!msg?.ciphertext || !msg?.iv) {
       return msg?.content ?? '';
     }
+    if (!privateKeyRef.current) {
+      return '[Unable to decrypt message]';
+    }
+
     const senderId = Number(msg.sender_id ?? msg.senderId);
     const receiverId = Number(msg.receiver_id ?? msg.receiverId);
     const peerForDerive = senderId === Number(userId) ? receiverId : senderId;
 
-    const sharedKey = await getSharedKeyForPeer(peerForDerive, targetPeerPublicKey);
-    return decryptMessage(sharedKey, msg.ciphertext, msg.iv, { quiet: true });
+    let peerKey = targetPeerPublicKey;
+    if (!peerKey && peerForDerive) {
+      try {
+        const data = await api.getUserPublicKey(peerForDerive);
+        peerKey = data.publicKey;
+      } catch {
+        return '[Unable to decrypt message]';
+      }
+    }
+
+    try {
+      const sharedKey = await getSharedKeyForPeer(peerForDerive, peerKey);
+      return decryptMessage(sharedKey, msg.ciphertext, msg.iv, { quiet: true });
+    } catch {
+      return '[Unable to decrypt message]';
+    }
   }, [userId, peerPublicKey, getSharedKeyForPeer]);
 
   const decryptMessageList = useCallback(async (list, targetPeerPublicKey = peerPublicKey) => {
@@ -110,6 +128,13 @@ export function useE2EE({ userId, peerId, peerPublicKey }) {
     if (!recipientPublicKey) {
       const fresh = await api.getUserPublicKey(receiverId);
       recipientPublicKey = fresh.publicKey;
+    } else {
+      try {
+        const fresh = await api.getUserPublicKey(receiverId);
+        if (fresh.publicKey) recipientPublicKey = fresh.publicKey;
+      } catch {
+        // use cached peer key
+      }
     }
 
     const trimmed = plaintext?.trim();

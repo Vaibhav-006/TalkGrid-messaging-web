@@ -1,9 +1,8 @@
 /**
- * E2EE keys — stored locally (same browser) + encrypted backup on server (other devices).
- * Password is only used at login/register — never a separate encryption prompt.
+ * E2EE keys — stored locally + encrypted backup on server for other devices.
  */
 
-import { generateKeyPair, exportPublicKey } from './cryptoUtils';
+import { generateKeyPair, exportPublicKey, verifyKeyPairMatches } from './cryptoUtils';
 import {
   getPrivateKey,
   savePrivateKey,
@@ -83,6 +82,24 @@ async function uploadBackupSilently(userId, pkcs8Bytes, password) {
   }
 }
 
+/** Keep server public key in sync with this device's key pair. */
+async function syncLocalPublicKeyToServer(userId, privateKey, publicKeyBase64) {
+  if (!publicKeyBase64) return publicKeyBase64;
+
+  const matches = await verifyKeyPairMatches(privateKey, publicKeyBase64);
+  if (!matches) {
+    console.warn('[E2EE] Local public key does not match private key — regenerating pair');
+    return null;
+  }
+
+  try {
+    await uploadPublicKey(publicKeyBase64);
+  } catch (err) {
+    console.warn('[E2EE] Public key upload failed:', err);
+  }
+  return publicKeyBase64;
+}
+
 async function restoreFromServerBackup(userId, password, profile) {
   const backup = {
     encryptedPrivateKey: profile.encryptedPrivateKeyBackup,
@@ -99,21 +116,22 @@ async function restoreFromServerBackup(userId, password, profile) {
   }
 
   const { privateKey, pkcs8 } = await decryptPkcs8WithPassword(backup, password);
+  const matches = await verifyKeyPairMatches(privateKey, publicKeyBase64);
+  if (!matches) {
+    console.warn('[E2EE] Restored keys do not match profile public key');
+    return false;
+  }
+
   await savePrivateKey(userId, privateKey, pkcs8);
   await savePublicKey(userId, publicKeyBase64);
   return true;
 }
 
-/**
- * @param {number|string} userId
- * @param {{ password?: string }} [options] - password from login/register (not a separate prompt)
- */
 export async function initializeUserKeys(userId, options = {}) {
   if (!userId) throw new Error('userId is required');
 
   const password = options.password || null;
 
-  // ── Same browser: keys already here ──
   let privateKey = await getPrivateKey(userId);
   let publicKeyBase64 = await getPublicKey(userId);
 
@@ -122,29 +140,39 @@ export async function initializeUserKeys(userId, options = {}) {
       try {
         const profile = await fetchUserProfile();
         if (profile?.publicKey) {
-          publicKeyBase64 = profile.publicKey;
-          await savePublicKey(userId, publicKeyBase64);
+          const ok = await verifyKeyPairMatches(privateKey, profile.publicKey);
+          if (ok) {
+            publicKeyBase64 = profile.publicKey;
+            await savePublicKey(userId, publicKeyBase64);
+          }
         }
       } catch {
         // non-fatal
       }
     }
+
+    if (publicKeyBase64) {
+      await syncLocalPublicKeyToServer(userId, privateKey, publicKeyBase64);
+    } else {
+      console.warn('[E2EE] Private key present but no matching public key');
+    }
+
     const pkcs8 = getPkcs8Bytes(userId);
     if (password && pkcs8) {
       uploadBackupSilently(userId, pkcs8, password);
     }
+
     console.log('[E2EE] Keys loaded from this browser');
     return { status: 'SUCCESS', action: 'KEYS_REUSED' };
   }
 
-  // ── New browser/device: restore from server backup using login password ──
   if (password) {
     try {
       const profile = await fetchUserProfile();
       if (profile?.encryptedPrivateKeyBackup) {
         const restored = await restoreFromServerBackup(userId, password, profile);
         if (restored) {
-          console.log('[E2EE] Keys restored from server backup (new device)');
+          console.log('[E2EE] Keys restored from server backup');
           return { status: 'SUCCESS', action: 'KEYS_RESTORED' };
         }
       }
@@ -153,8 +181,7 @@ export async function initializeUserKeys(userId, options = {}) {
     }
   }
 
-  // ── First time ever, or legacy account without backup ──
-  console.log('[E2EE] Creating new encryption keys for this device...');
+  console.log('[E2EE] Creating new encryption keys...');
   const { publicKey, privateKey: newPrivate, privateKeyPkcs8 } = await generateKeyPair();
   publicKeyBase64 = await exportPublicKey(publicKey);
 
@@ -165,19 +192,12 @@ export async function initializeUserKeys(userId, options = {}) {
     throw new Error('Could not save encryption keys');
   }
 
-  try {
-    const profile = await fetchUserProfile();
-    if (!profile?.publicKey) {
-      await uploadPublicKey(publicKeyBase64);
-    }
-  } catch {
-    await uploadPublicKey(publicKeyBase64);
-  }
+  await uploadPublicKey(publicKeyBase64);
 
   if (password) {
     await uploadBackupSilently(userId, privateKeyPkcs8, password);
   }
 
-  console.log('[E2EE] New keys created');
+  console.log('[E2EE] New keys created and uploaded');
   return { status: 'SUCCESS', action: 'KEYS_CREATED' };
 }

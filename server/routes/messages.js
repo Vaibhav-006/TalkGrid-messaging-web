@@ -1,97 +1,77 @@
 const express = require('express');
-const db = require('../db');
-const { MongoMessage, saveMessageToMongo, ensureMongoConnected } = require('../mongo');
+const {
+  Message,
+  formatMessage,
+  nextMessageId,
+  findUserBySqlId,
+  formatUser,
+  ensureMongoConnected,
+} = require('../mongo');
 const { authMiddleware } = require('../auth');
-const { emitToConversationMembers } = require('../conversationUtils');
+const { emitToConversationMembers, isConversationMember } = require('../conversationUtils');
 const { saveAndBroadcastEncryptedMessage } = require('../e2eeMessages');
 
 function createRouter(io) {
   const router = express.Router();
   router.use(authMiddleware);
 
-  function parseCreatedAt(value) {
-    if (!value) return null;
-    if (value instanceof Date) return value;
-    const str = String(value);
-    if (!str) return null;
-    // SQLite CURRENT_TIMESTAMP is UTC like "YYYY-MM-DD HH:MM:SS"
-    let normalized = str.includes('T') ? str : str.replace(' ', 'T');
-    const hasZone = normalized.endsWith('Z') || /[+\-]\d{2}:\d{2}$/.test(normalized);
-    if (!hasZone) normalized += 'Z';
-    const d = new Date(normalized);
-    if (Number.isNaN(d.getTime())) return null;
-    return d;
-  }
-
-  // Get messages for a conversation
   router.get('/conversation/:conversationId', async (req, res) => {
-    const convId = parseInt(req.params.conversationId, 10);
-    const member = db.prepare('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?').get(convId, req.user.id);
-    if (!member) return res.status(404).json({ error: 'Conversation not found' });
-
-    const mongoReady = await ensureMongoConnected();
-    if (mongoReady) {
-      const mongoMessages = await MongoMessage.find({ conversationSqlId: convId }).sort({ createdAt: 1 }).lean();
-      if (mongoMessages?.length) {
-        const mapped = mongoMessages.map((message) => ({
-          id: message._id ?? message.id,
-          conversation_id: convId,
-          sender_id: message.senderSqlId,
-          content: message.content ?? '',
-          created_at: message.createdAt ?? message.created_at,
-          sender: null,
-        }));
-        return res.json(mapped);
+    try {
+      await ensureMongoConnected();
+      const convId = parseInt(req.params.conversationId, 10);
+      if (!(await isConversationMember(convId, req.user.id))) {
+        return res.status(404).json({ error: 'Conversation not found' });
       }
+      const messages = await Message.find({ conversationSqlId: convId }).sort({ createdAt: 1 }).lean();
+      const senderIds = [...new Set(messages.map((m) => m.senderSqlId))];
+      const users = await Promise.all(senderIds.map((id) => findUserBySqlId(id)));
+      const userMap = new Map(users.filter(Boolean).map((u) => [u.sqlId, formatUser(u)]));
+      res.json(messages.map((m) => formatMessage(m, userMap.get(m.senderSqlId) ?? null)));
+    } catch (err) {
+      console.error('GET messages error:', err);
+      res.status(500).json({ error: 'Failed to load messages' });
     }
-
-    const messages = db.prepare(`
-      SELECT id, sender_id, content, created_at
-      FROM messages
-      WHERE conversation_id = ?
-      ORDER BY created_at ASC
-    `).all(convId);
-    res.json(messages);
   });
 
-  // Send a message (works even when socket is not connected)
   router.post('/send', async (req, res) => {
-    const { conversationId, content } = req.body;
-    if (!content?.trim()) return res.status(400).json({ error: 'Content required' });
-    const convId = parseInt(conversationId, 10);
-    const member = db.prepare('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ?').get(convId, req.user.id);
-    if (!member) return res.status(404).json({ error: 'Conversation not found' });
-    db.prepare('INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)').run(convId, req.user.id, content.trim());
-    const row = db.prepare('SELECT id, conversation_id, sender_id, content, created_at FROM messages WHERE id = (SELECT last_insert_rowid())').get();
-    const senderRow = db.prepare('SELECT id, username, display_name, avatar_color FROM users WHERE id = ?').get(req.user.id);
-    const sender = senderRow ? {
-      id: senderRow.id ?? senderRow.ID,
-      username: senderRow.username ?? senderRow.USERNAME,
-      display_name: senderRow.display_name ?? senderRow.DISPLAY_NAME,
-      avatar_color: senderRow.avatar_color ?? senderRow.AVATAR_COLOR,
-    } : null;
-    const payload = {
-      id: row?.id ?? row?.ID,
-      conversation_id: row?.conversation_id ?? row?.CONVERSATION_ID ?? convId,
-      sender_id: row?.sender_id ?? row?.SENDER_ID ?? req.user.id,
-      content: row?.content ?? row?.CONTENT ?? content.trim(),
-      created_at: row?.created_at ?? row?.CREATED_AT,
-      sender,
-    };
-    await saveMessageToMongo({
-      conversationSqlId: convId,
-      senderSqlId: req.user.id,
-      content: payload.content,
-    }).catch((err) => {
-      console.error('MongoMessage create failed:', err.message);
-    });
-    emitToConversationMembers(io, convId, 'message:new', payload);
-    res.status(201).json(payload);
+    try {
+      await ensureMongoConnected();
+      const { conversationId, content } = req.body;
+      if (!content?.trim()) return res.status(400).json({ error: 'Content required' });
+      const convId = parseInt(conversationId, 10);
+      if (!(await isConversationMember(convId, req.user.id))) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+
+      const messageSqlId = await nextMessageId();
+      const msg = await Message.create({
+        sqlId: messageSqlId,
+        conversationSqlId: convId,
+        senderSqlId: Number(req.user.id),
+        content: content.trim(),
+      });
+
+      const senderDoc = await findUserBySqlId(req.user.id);
+      const payload = {
+        id: msg.sqlId,
+        conversation_id: convId,
+        sender_id: msg.senderSqlId,
+        content: msg.content,
+        created_at: msg.createdAt,
+        sender: formatUser(senderDoc),
+      };
+
+      emitToConversationMembers(io, convId, 'message:new', payload);
+      res.status(201).json(payload);
+    } catch (err) {
+      console.error('POST /send error:', err);
+      res.status(500).json({ error: 'Failed to send message' });
+    }
   });
 
-  /** Send an E2EE message via REST (reliable fallback; also emits receive_message over socket). */
   router.post('/send-encrypted', async (req, res) => {
     try {
+      await ensureMongoConnected();
       const { conversationId, receiverId, ciphertext, iv } = req.body;
       const ct = typeof ciphertext === 'string' ? ciphertext.trim() : '';
       const ivStr = typeof iv === 'string' ? iv.trim() : '';
@@ -116,34 +96,37 @@ function createRouter(io) {
       return res.status(201).json(outbound);
     } catch (err) {
       console.error('[E2EE] POST /send-encrypted failed:', err);
-      const status = err.status || 500;
-      return res.status(status).json({ error: err.message || 'Failed to send encrypted message' });
+      return res.status(err.status || 500).json({ error: err.message || 'Failed to send encrypted message' });
     }
   });
 
-  // Delete a message (only sender, only within 5 minutes). Deletes for both ends via socket event.
-  const DELETE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-  router.delete('/:id', (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!id || Number.isNaN(id)) {
-      return res.status(400).json({ error: 'Invalid message id' });
-    }
-    const msg = db.prepare('SELECT id, conversation_id, sender_id, created_at FROM messages WHERE id = ?').get(id);
-    if (!msg) return res.status(404).json({ error: 'Message not found' });
-    if (msg.sender_id !== req.user.id) {
-      return res.status(403).json({ error: 'You can only delete your own messages' });
-    }
-    const created = parseCreatedAt(msg.created_at ?? msg.CREATED_AT);
-    if (created) {
-      const createdMs = created.getTime();
-      if (Date.now() - createdMs > DELETE_WINDOW_MS) {
+  const DELETE_WINDOW_MS = 5 * 60 * 1000;
+
+  router.delete('/:id', async (req, res) => {
+    try {
+      await ensureMongoConnected();
+      const id = parseInt(req.params.id, 10);
+      if (!id || Number.isNaN(id)) {
+        return res.status(400).json({ error: 'Invalid message id' });
+      }
+      const msg = await Message.findOne({ sqlId: id }).lean();
+      if (!msg) return res.status(404).json({ error: 'Message not found' });
+      if (msg.senderSqlId !== Number(req.user.id)) {
+        return res.status(403).json({ error: 'You can only delete your own messages' });
+      }
+      if (msg.createdAt && Date.now() - new Date(msg.createdAt).getTime() > DELETE_WINDOW_MS) {
         return res.status(403).json({ error: 'Can only delete messages within 5 minutes' });
       }
+      await Message.deleteOne({ sqlId: id });
+      emitToConversationMembers(io, msg.conversationSqlId, 'message:deleted', {
+        id,
+        conversation_id: msg.conversationSqlId,
+      });
+      return res.status(204).end();
+    } catch (err) {
+      console.error('DELETE message error:', err);
+      return res.status(500).json({ error: 'Failed to delete message' });
     }
-    db.prepare('DELETE FROM messages WHERE id = ?').run(id);
-    const payload = { id, conversation_id: msg.conversation_id };
-    emitToConversationMembers(io, msg.conversation_id, 'message:deleted', payload);
-    return res.status(204).end();
   });
 
   return router;

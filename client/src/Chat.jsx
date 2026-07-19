@@ -121,7 +121,7 @@ const [selectedStatuses, setSelectedStatuses] = useState(null);
     if (value instanceof Date) return value;
     const str = String(value);
     if (!str) return null;
-    // SQLite CURRENT_TIMESTAMP is UTC like "YYYY-MM-DD HH:MM:SS"
+    // Legacy UTC timestamp format compatibility
     let normalized = str.includes('T') ? str : str.replace(' ', 'T');
     const hasZone = normalized.endsWith('Z') || /[+\-]\d{2}:\d{2}$/.test(normalized);
     if (!hasZone) normalized += 'Z';
@@ -467,23 +467,32 @@ useEffect(() => {
     if (!sock || isGroup || !peerPublicKey || !other?.id) return;
 
     const onReceive = async (payload) => {
-      if (Number(payload.senderId ?? payload.sender_id) === Number(user.id)) return;
+      const senderId = Number(payload.senderId ?? payload.sender_id);
+      if (senderId === Number(user.id)) return;
 
       const convId = payload.conversationId ?? payload.conversation_id;
       if (convId != null && Number(convId) !== Number(selectedId)) return;
 
-      const involved =
-        Number(payload.senderId) === Number(user.id) ||
-        Number(payload.receiverId) === Number(user.id);
+      const receiverId = Number(payload.receiverId ?? payload.receiver_id);
+      const involved = senderId === Number(user.id) || receiverId === Number(user.id);
       if (!involved) return;
 
-      const peerId = Number(payload.senderId) === Number(user.id)
-        ? payload.receiverId
-        : payload.senderId;
+      const peerId = senderId === Number(user.id) ? receiverId : senderId;
       if (Number(peerId) !== Number(other.id)) return;
 
+      if (!keysReady) return;
+
       try {
-        const content = await decryptChatMessage(payload, peerPublicKey);
+        let senderPubKey = peerPublicKey;
+        if (senderId === Number(other.id)) {
+          try {
+            const data = await api.getUserPublicKey(senderId);
+            senderPubKey = data.publicKey;
+          } catch {
+            senderPubKey = peerPublicKey;
+          }
+        }
+        const content = await decryptChatMessage(payload, senderPubKey);
         const fixed = {
           id: payload.id ?? `${payload.senderId}-${payload.iv}`,
           sender_id: payload.senderId ?? payload.sender_id,
@@ -507,7 +516,7 @@ useEffect(() => {
 
     sock.on('receive_message', onReceive);
     return () => sock.off('receive_message', onReceive);
-  }, [selectedId, isGroup, peerPublicKey, other?.id, user.id, decryptChatMessage, loadConversations]);
+  }, [selectedId, isGroup, peerPublicKey, keysReady, other?.id, user.id, decryptChatMessage, loadConversations]);
 
   const handleSend = async (e) => {
     if (e) e.preventDefault();

@@ -1,6 +1,11 @@
 const express = require('express');
 const multer = require('multer');
-const db = require('../db');
+const {
+  Status,
+  User,
+  nextStatusId,
+  ensureMongoConnected,
+} = require('../mongo');
 const { authMiddleware } = require('../auth');
 
 const router = express.Router();
@@ -21,52 +26,75 @@ const storage = new CloudinaryStorage({
 });
 
 const upload = multer({ storage, limits: { fileSize: 25 * 1024 * 1024 } });
-function formatStatus(row) {
-  if (!row) return null;
+
+function formatStatus(doc, user) {
+  if (!doc) return null;
   return {
-    id: row.id ?? row.ID,
-    user_id: row.user_id ?? row.USER_ID,
-    media_url: row.media_url ?? row.MEDIA_URL,
-    type: row.type ?? row.TYPE,
-    created_at: row.created_at ?? row.CREATED_AT,
-    username: row.username ?? row.USERNAME,
-    display_name: row.display_name ?? row.DISPLAY_NAME,
-    avatar_color: row.avatar_color ?? row.AVATAR_COLOR,
+    id: doc.sqlId,
+    user_id: doc.userSqlId,
+    media_url: doc.mediaUrl,
+    type: doc.type,
+    created_at: doc.createdAt,
+    username: user?.username,
+    display_name: user?.displayName ?? null,
+    avatar_color: user?.avatarColor ?? '#25D366',
   };
 }
 
-router.post('/', upload.single('media'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'File required' });
-  const type = req.file.mimetype.startsWith('video') ? 'video' : 'image';
-  const result = db.prepare(
-    'INSERT INTO status (user_id, media_url, type) VALUES (?, ?, ?)'
-  ).run(req.user.id, req.file.path, type);
-  const status = db.prepare(`
-    SELECT s.*, u.username, u.display_name, u.avatar_color
-    FROM status s JOIN users u ON u.id = s.user_id WHERE s.id = ?
-  `).get(result.lastInsertRowid);
-  res.status(201).json(formatStatus(status));
+router.post('/', upload.single('media'), async (req, res) => {
+  try {
+    await ensureMongoConnected();
+    if (!req.file) return res.status(400).json({ error: 'File required' });
+    const type = req.file.mimetype.startsWith('video') ? 'video' : 'image';
+    const sqlId = await nextStatusId();
+    const status = await Status.create({
+      sqlId,
+      userSqlId: Number(req.user.id),
+      mediaUrl: req.file.path,
+      type,
+    });
+    const user = await User.findOne({ sqlId: Number(req.user.id) }).lean();
+    res.status(201).json(formatStatus(status, user));
+  } catch (err) {
+    console.error('Status upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
 });
 
-router.get('/', (req, res) => {
-  const statuses = db.prepare(`
-    SELECT s.*, u.username, u.display_name, u.avatar_color
-    FROM status s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.created_at >= datetime('now', '-1 day')
-    ORDER BY s.created_at DESC
-  `).all();
-  res.json(statuses.map(formatStatus));
-});
-router.delete('/:id', (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  const status = db.prepare('SELECT * FROM status WHERE id = ?').get(id);
-  if (!status) return res.status(404).json({ error: 'Not found' });
-  if ((status.user_id ?? status.USER_ID) !== req.user.id) {
-    return res.status(403).json({ error: 'Not allowed' });
+router.get('/', async (req, res) => {
+  try {
+    await ensureMongoConnected();
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const statuses = await Status.find({ createdAt: { $gte: since } })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const userIds = [...new Set(statuses.map((s) => s.userSqlId))];
+    const users = await User.find({ sqlId: { $in: userIds } }).lean();
+    const userMap = new Map(users.map((u) => [u.sqlId, u]));
+
+    res.json(statuses.map((s) => formatStatus(s, userMap.get(s.userSqlId))));
+  } catch (err) {
+    console.error('Status list error:', err);
+    res.status(500).json({ error: 'Failed to load statuses' });
   }
-  db.prepare('DELETE FROM status WHERE id = ?').run(id);
-  res.json({ success: true });
+});
+
+router.delete('/:id', async (req, res) => {
+  try {
+    await ensureMongoConnected();
+    const id = parseInt(req.params.id, 10);
+    const status = await Status.findOne({ sqlId: id }).lean();
+    if (!status) return res.status(404).json({ error: 'Not found' });
+    if (status.userSqlId !== Number(req.user.id)) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+    await Status.deleteOne({ sqlId: id });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Status delete error:', err);
+    res.status(500).json({ error: 'Delete failed' });
+  }
 });
 
 module.exports = router;
