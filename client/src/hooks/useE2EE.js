@@ -42,15 +42,18 @@ export function useE2EE({ userId, peerId, peerPublicKey }) {
     if (!userId) return;
     setKeyError('');
     try {
-      const privateKey = await getPrivateKey(userId);
-      if (!privateKey) {
-        privateKeyRef.current = null;
-        setKeysReady(false);
-        setKeyError('Encryption keys not found. Log out and sign in again.');
-        return;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        const privateKey = await getPrivateKey(userId);
+        if (privateKey) {
+          privateKeyRef.current = privateKey;
+          setKeysReady(true);
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 400));
       }
-      privateKeyRef.current = privateKey;
-      setKeysReady(true);
+      privateKeyRef.current = null;
+      setKeysReady(false);
+      setKeyError('Encryption keys not ready. Log out and sign in with your password.');
     } catch (err) {
       console.error('[E2EE] Failed to load encryption keys:', err);
       setKeyError(err?.message || 'Failed to load encryption keys');

@@ -448,7 +448,13 @@ useEffect(() => {
       if (!needsDecrypt) return;
       try {
         const decrypted = await decryptMessageList(messages, peerPublicKey);
-        if (!cancelled) setMessages(decrypted);
+        if (!cancelled) {
+          setMessages((prev) => {
+            if (prev.length !== decrypted.length) return decrypted;
+            const changed = decrypted.some((m, i) => m.content !== prev[i]?.content);
+            return changed ? decrypted : prev;
+          });
+        }
       } catch (err) {
         console.error('[E2EE] Failed to decrypt history:', err);
       }

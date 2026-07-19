@@ -10,7 +10,7 @@ import {
 } from './keyStorage';
 import { fetchUserProfile, uploadPublicKey } from '../api';
 
-/** @deprecated Use authKeyHandler.initializeUserKeys — kept for backwards compatibility. */
+/** @deprecated Use authKeyHandler.initializeUserKeys */
 export async function ensureUserEncryptionKeys(userId) {
   const privateKey = await getPrivateKey(userId);
   if (privateKey) {
@@ -26,22 +26,12 @@ export async function ensureUserEncryptionKeys(userId) {
         // ignore
       }
     }
-    if (cachedPublic) {
-      try {
-        const profile = await fetchUserProfile();
-        if (!profile?.publicKey) {
-          await uploadPublicKey(cachedPublic);
-        }
-      } catch {
-        // ignore
-      }
-    }
     return;
   }
 
-  const { publicKey, privateKey: newPrivate } = await generateKeyPair();
+  const { publicKey, privateKey: newPrivate, privateKeyPkcs8 } = await generateKeyPair();
   const cachedPublic = await exportPublicKey(publicKey);
-  await savePrivateKey(userId, newPrivate);
+  await savePrivateKey(userId, newPrivate, privateKeyPkcs8);
   await savePublicKey(userId, cachedPublic);
   await uploadPublicKey(cachedPublic);
 }

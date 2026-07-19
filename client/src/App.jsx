@@ -9,7 +9,7 @@ import { initializeUserKeys, recoverKeysFromBackup, generateFreshKeysAfterSkip }
 const TOKEN_KEY = 'chat_token';
 const USER_KEY = 'chat_user';
 
-function KeyRecoveryModal({ userId, onRecover, onSkip, onError }) {
+function KeyRecoveryModal({ userId, passwordHint, onRecover, onSkip, onError }) {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -32,14 +32,11 @@ function KeyRecoveryModal({ userId, onRecover, onSkip, onError }) {
     <div className="modal-overlay">
       <div className="modal-content">
         <h2>Recover Encryption Keys</h2>
-        <p>
-          Your encryption keys were not found on this device. 
-          Enter your password to recover them from your encrypted backup.
-        </p>
+        <p>{passwordHint}</p>
         {error && <div className="auth-error">{error}</div>}
         <input
           type="password"
-          placeholder="Enter your password"
+          placeholder="Enter your account password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           disabled={loading}
@@ -50,7 +47,7 @@ function KeyRecoveryModal({ userId, onRecover, onSkip, onError }) {
             {loading ? 'Recovering...' : 'Recover Keys'}
           </button>
           <button onClick={onSkip} disabled={loading} style={{ opacity: 0.6 }}>
-            Skip (Can't read old messages)
+            Create new keys (old messages unreadable)
           </button>
         </div>
       </div>
@@ -63,66 +60,63 @@ function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
   const [authMode, setAuthMode] = useState('login');
   const [loading, setLoading] = useState(true);
-  const [e2eeReady, setE2eeReady] = useState(false);
   const [error, setError] = useState('');
   const [keyRecoveryModal, setKeyRecoveryModal] = useState(null);
   const pendingPasswordRef = useRef(null);
 
+  const finishKeyInit = () => {
+    window.dispatchEvent(new Event('e2ee-keys-restored'));
+  };
+
   const initializeKeys = async (userId, password = null) => {
-    setE2eeReady(false);
-    const timeoutMs = 12000;
     try {
       const result = await Promise.race([
         initializeUserKeys(userId, { password }),
         new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('Encryption setup timed out')), timeoutMs);
+          setTimeout(() => reject(new Error('Encryption setup timed out')), 15000);
         }),
       ]);
 
       if (result.status === 'NEEDS_BACKUP_RESTORE') {
-        if (result.hasBackup) {
-          setKeyRecoveryModal(userId);
-        } else {
-          await generateFreshKeysAfterSkip(userId);
-          setE2eeReady(true);
-          window.dispatchEvent(new Event('e2ee-keys-restored'));
-        }
+        setKeyRecoveryModal({
+          userId,
+          hasBackup: result.hasBackup,
+          message: result.message,
+        });
         return;
       }
 
-      setE2eeReady(true);
+      finishKeyInit();
       console.log('[E2EE] Key initialization successful:', result);
     } catch (err) {
       console.error('[E2EE] Key initialization failed:', err);
-      setError('Encryption setup failed: ' + err.message);
-      setE2eeReady(true);
+      finishKeyInit();
     }
   };
 
   const handleKeyRecoveryComplete = () => {
     setKeyRecoveryModal(null);
-    setE2eeReady(true);
-    window.dispatchEvent(new Event('e2ee-keys-restored'));
+    finishKeyInit();
   };
 
   const handleKeyRecoverySkip = async () => {
-    if (keyRecoveryModal) {
+    if (keyRecoveryModal?.userId) {
       try {
-        await generateFreshKeysAfterSkip(keyRecoveryModal);
-        setE2eeReady(true);
-        window.dispatchEvent(new Event('e2ee-keys-restored'));
+        await generateFreshKeysAfterSkip(
+          keyRecoveryModal.userId,
+          pendingPasswordRef.current
+        );
       } catch (err) {
-        console.error('[E2EE] Failed to create new keys after skip:', err);
-        setE2eeReady(true);
+        console.error('[E2EE] Failed to create new keys:', err);
       }
     }
     setKeyRecoveryModal(null);
+    finishKeyInit();
   };
 
   useEffect(() => {
     if (!token) {
       setUser(null);
-      setE2eeReady(false);
       setLoading(false);
       return;
     }
@@ -139,7 +133,6 @@ function App() {
         localStorage.removeItem(USER_KEY);
         setToken(null);
         setUser(null);
-        setE2eeReady(false);
         disconnectSocket();
         setError(err?.message || 'Session expired — please sign in again');
       })
@@ -171,7 +164,6 @@ function App() {
     localStorage.removeItem(USER_KEY);
     setToken(null);
     setUser(null);
-    setE2eeReady(false);
     setError('');
     disconnectSocket();
     setKeyRecoveryModal(null);
@@ -184,7 +176,6 @@ function App() {
         <div className="auth-loading">
           <div className="loading-spinner" aria-hidden />
           <p>Connecting to TalkGrid…</p>
-          <p className="auth-loading-hint">Make sure <code>npm run dev</code> is running</p>
         </div>
       </div>
     );
@@ -214,25 +205,15 @@ function App() {
 
   if (keyRecoveryModal) {
     return (
-      <KeyRecoveryModal
-        userId={keyRecoveryModal}
-        onRecover={handleKeyRecoveryComplete}
-        onSkip={handleKeyRecoverySkip}
-        onError={(err) => {
-          console.error('[E2EE] Key recovery error:', err);
-        }}
-      />
-    );
-  }
-
-  if (user && !keyRecoveryModal && !e2eeReady) {
-    return (
-      <div className="auth-screen">
-        <div className="auth-loading">
-          <div className="loading-spinner" aria-hidden />
-          <p>Loading encryption keys…</p>
-        </div>
-      </div>
+      <>
+        <KeyRecoveryModal
+          userId={keyRecoveryModal.userId}
+          passwordHint={keyRecoveryModal.message}
+          onRecover={handleKeyRecoveryComplete}
+          onSkip={handleKeyRecoverySkip}
+          onError={(err) => console.error('[E2EE] Key recovery error:', err)}
+        />
+      </>
     );
   }
 

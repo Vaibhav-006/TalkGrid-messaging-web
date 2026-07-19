@@ -1,6 +1,6 @@
 /**
  * E2EE key initialization — runs once on login/register.
- * Never regenerates keys when a private key already exists in IndexedDB.
+ * Never regenerates keys when a private key already exists in local storage.
  */
 
 import {
@@ -13,13 +13,12 @@ import {
   getPublicKey,
   savePublicKey,
   saveEncryptedPrivateKeyBackup,
+  saveLocalEncryptedBackup,
+  getLocalEncryptedBackup,
   hasKeyStoredFlag,
 } from './keyStorage';
 import { fetchUserProfile, uploadPublicKey, uploadEncryptedKeyBackup } from '../api';
 
-/**
- * Derives an encryption key from user's password using PBKDF2.
- */
 export async function derivePBKDF2Key(password, salt) {
   const encoder = new TextEncoder();
   const data = encoder.encode(password);
@@ -46,19 +45,14 @@ export async function derivePBKDF2Key(password, salt) {
   );
 }
 
-/**
- * Encrypt PKCS8 private key bytes with a password-derived key.
- */
 export async function encryptPrivateKeyPkcs8WithPassword(pkcs8Bytes, password) {
   const salt = window.crypto.getRandomValues(new Uint8Array(16));
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
-
   const encryptionKey = await derivePBKDF2Key(password, salt);
-
   const encryptedData = await window.crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     encryptionKey,
-    pkcs8Bytes
+    toPkcs8Buffer(pkcs8Bytes)
   );
 
   return {
@@ -68,9 +62,17 @@ export async function encryptPrivateKeyPkcs8WithPassword(pkcs8Bytes, password) {
   };
 }
 
-/**
- * Decrypts a private key backup and imports it as a non-extractable CryptoKey.
- */
+function toPkcs8Buffer(pkcs8Bytes) {
+  if (pkcs8Bytes instanceof ArrayBuffer) return pkcs8Bytes;
+  if (ArrayBuffer.isView(pkcs8Bytes)) {
+    return pkcs8Bytes.buffer.slice(
+      pkcs8Bytes.byteOffset,
+      pkcs8Bytes.byteOffset + pkcs8Bytes.byteLength
+    );
+  }
+  throw new Error('Invalid PKCS8 bytes');
+}
+
 export async function decryptPrivateKeyWithPassword(
   encryptedPrivateKeyBase64,
   ivBase64,
@@ -80,25 +82,72 @@ export async function decryptPrivateKeyWithPassword(
   const encryptedData = Uint8Array.from(atob(encryptedPrivateKeyBase64), (c) => c.charCodeAt(0));
   const iv = Uint8Array.from(atob(ivBase64), (c) => c.charCodeAt(0));
   const salt = Uint8Array.from(atob(saltBase64), (c) => c.charCodeAt(0));
-
   const decryptionKey = await derivePBKDF2Key(password, salt);
-
   const decryptedPrivateKeyBytes = await window.crypto.subtle.decrypt(
     { name: 'AES-GCM', iv },
     decryptionKey,
     encryptedData
   );
 
-  return window.crypto.subtle.importKey(
-    'pkcs8',
-    decryptedPrivateKeyBytes,
-    { name: 'ECDH', namedCurve: 'P-256' },
-    false,
-    ['deriveKey']
-  );
+  return {
+    privateKey: await window.crypto.subtle.importKey(
+      'pkcs8',
+      decryptedPrivateKeyBytes,
+      { name: 'ECDH', namedCurve: 'P-256' },
+      false,
+      ['deriveKey']
+    ),
+    pkcs8: decryptedPrivateKeyBytes,
+  };
 }
 
-/** Upload public key only when the server does not already have one. */
+async function persistKeyPair(userId, privateKey, publicKeyBase64, pkcs8Bytes) {
+  await savePrivateKey(userId, privateKey, pkcs8Bytes);
+  await savePublicKey(userId, publicKeyBase64);
+  const persisted = await getPrivateKey(userId);
+  if (!persisted) {
+    throw new Error('Failed to persist encryption keys in this browser');
+  }
+}
+
+async function storePasswordBackups(userId, pkcs8Bytes, password, publicKeyBase64) {
+  if (!password || !pkcs8Bytes) return;
+
+  const backup = await encryptPrivateKeyPkcs8WithPassword(pkcs8Bytes, password);
+  saveLocalEncryptedBackup(userId, backup);
+
+  try {
+    await uploadEncryptedKeyBackup({
+      encryptedPrivateKey: backup.encryptedPrivateKey,
+      iv: backup.iv,
+      salt: backup.salt,
+    });
+    await saveEncryptedPrivateKeyBackup(userId, backup);
+  } catch (err) {
+    console.warn('[E2EE] Server backup upload failed (local backup saved):', err);
+  }
+
+  try {
+    const profile = await fetchUserProfile();
+    if (!profile?.publicKey) {
+      await uploadPublicKey(publicKeyBase64);
+    }
+  } catch {
+    await uploadPublicKey(publicKeyBase64);
+  }
+}
+
+async function restoreFromEncryptedBackup(userId, backup, password, publicKeyBase64) {
+  const { privateKey, pkcs8 } = await decryptPrivateKeyWithPassword(
+    backup.encryptedPrivateKey,
+    backup.iv,
+    backup.salt,
+    password
+  );
+  await persistKeyPair(userId, privateKey, publicKeyBase64, pkcs8);
+  saveLocalEncryptedBackup(userId, backup);
+}
+
 async function syncPublicKeyIfMissing(localPublicKeyBase64) {
   if (!localPublicKeyBase64) return;
   try {
@@ -111,9 +160,6 @@ async function syncPublicKeyIfMissing(localPublicKeyBase64) {
   }
 }
 
-/**
- * Initialize or recover user's encryption keys.
- */
 export async function initializeUserKeys(userId, options = {}) {
   if (!userId) {
     throw new Error('userId is required for key initialization');
@@ -121,14 +167,13 @@ export async function initializeUserKeys(userId, options = {}) {
 
   const password = options.password || null;
 
-  // STEP 1: Reuse private key from IndexedDB — never delete or regenerate it.
-  console.log('[E2EE] Checking IndexedDB for existing private key...');
+  // STEP 1: Reuse private key from local storage — never delete or regenerate.
+  console.log('[E2EE] Checking local storage for existing private key...');
   let localPrivateKey = await getPrivateKey(userId);
   let localPublicKey = await getPublicKey(userId);
 
   if (localPrivateKey) {
     if (!localPublicKey) {
-      console.log('[E2EE] Private key found but public key missing locally — fetching from server...');
       try {
         const profile = await fetchUserProfile();
         if (profile?.publicKey) {
@@ -140,22 +185,44 @@ export async function initializeUserKeys(userId, options = {}) {
       }
     }
 
-    console.log('[E2EE] Existing private key found in IndexedDB — reusing for history integrity.');
-    syncPublicKeyIfMissing(localPublicKey).catch((err) => {
-      console.warn('[E2EE] Background public key sync failed:', err);
-    });
+    console.log('[E2EE] Existing private key loaded — reusing for history integrity.');
+    syncPublicKeyIfMissing(localPublicKey).catch(() => {});
     return {
       status: 'SUCCESS',
       action: 'KEYS_REUSED',
-      message: 'Existing encryption keys loaded from IndexedDB',
+      message: 'Existing encryption keys loaded',
     };
   }
 
-  // STEP 2: No local private key — check backend for recovery or new-user flow.
-  console.log('[E2EE] No local private key — fetching user profile from backend...');
-  if (hasKeyStoredFlag(userId)) {
-    console.warn('[E2EE] Key flag found in localStorage but IndexedDB is empty — browser storage may have been cleared.');
+  // STEP 2: Try local password backup (localStorage) before hitting server.
+  const localBackup = getLocalEncryptedBackup(userId);
+  if (localBackup && password) {
+    console.log('[E2EE] Trying local encrypted backup...');
+    try {
+      let publicKeyBase64 = localPublicKey;
+      if (!publicKeyBase64) {
+        const profile = await fetchUserProfile();
+        publicKeyBase64 = profile?.publicKey;
+      }
+      if (publicKeyBase64) {
+        await restoreFromEncryptedBackup(userId, localBackup, password, publicKeyBase64);
+        return {
+          status: 'SUCCESS',
+          action: 'KEYS_RESTORED_LOCAL',
+          message: 'Encryption keys restored from local backup',
+        };
+      }
+    } catch (err) {
+      console.warn('[E2EE] Local backup restore failed:', err);
+    }
   }
+
+  // STEP 3: Fetch server profile for recovery or new-user flow.
+  console.log('[E2EE] No local private key — checking server profile...');
+  if (hasKeyStoredFlag(userId)) {
+    console.warn('[E2EE] Key flag present but private key missing — storage may have been cleared.');
+  }
+
   let userProfile;
   try {
     userProfile = await fetchUserProfile();
@@ -169,83 +236,66 @@ export async function initializeUserKeys(userId, options = {}) {
   const backendIV = userProfile?.encryptedPrivateKeyIV || null;
   const backendSalt = userProfile?.encryptedPrivateKeySalt || null;
 
-  // STEP 3: Try automatic backup restore when password is available (login).
+  // STEP 4: Restore from server backup when password is available.
   if (backendEncryptedKeyBackup && backendIV && backendSalt && password) {
-    console.log('[E2EE] Encrypted backup found — restoring with login password...');
+    console.log('[E2EE] Restoring from server encrypted backup...');
     try {
       await recoverKeysFromBackup(userId, password, userProfile);
       return {
         status: 'SUCCESS',
         action: 'KEYS_RESTORED_FROM_BACKUP',
-        message: 'Encryption keys restored from encrypted backup',
+        message: 'Encryption keys restored from server backup',
       };
     } catch (err) {
-      console.warn('[E2EE] Automatic backup restore failed:', err);
+      console.warn('[E2EE] Server backup restore failed:', err);
     }
   }
 
-  if (backendPublicKey || backendEncryptedKeyBackup) {
-    if (backendEncryptedKeyBackup && backendIV && backendSalt) {
-      console.log('[E2EE] Encrypted backup found — password required for recovery.');
+  if (backendEncryptedKeyBackup && backendIV && backendSalt) {
+    return {
+      status: 'NEEDS_BACKUP_RESTORE',
+      action: 'RESTORE_FROM_BACKUP',
+      requiresPassword: true,
+      hasBackup: true,
+      message: 'Enter your password to recover encryption keys.',
+    };
+  }
+
+  if (backendPublicKey) {
+    if (password) {
       return {
         status: 'NEEDS_BACKUP_RESTORE',
         action: 'RESTORE_FROM_BACKUP',
         requiresPassword: true,
-        hasBackup: true,
-        message: 'Encrypted backup found. Please provide your password to recover encryption keys.',
+        hasBackup: false,
+        message: 'Encryption keys missing. Enter your password — if you registered before backup was enabled, old messages may be unreadable.',
       };
     }
-
-    console.log('[E2EE] Public key on server but no local keys or backup.');
     return {
       status: 'NEEDS_BACKUP_RESTORE',
-      action: 'MANUAL_KEY_RECOVERY_NEEDED',
-      requiresPassword: false,
+      action: 'RESTORE_FROM_BACKUP',
+      requiresPassword: true,
       hasBackup: false,
-      message: 'Encryption keys not found in this browser.',
+      message: 'Encryption keys missing. Log out and sign in again with your password.',
     };
   }
 
-  // STEP 4: Brand-new user — generate a fresh key pair.
+  // STEP 5: Brand-new user — generate keys and store PKCS8 bytes.
   console.log('[E2EE] New user — generating ECDH key pair...');
   const { publicKey, privateKey: newPrivate, privateKeyPkcs8 } = await generateKeyPair();
   const publicKeyBase64 = await exportPublicKey(publicKey);
 
-  await savePrivateKey(userId, newPrivate);
-  await savePublicKey(userId, publicKeyBase64);
-
-  const persisted = await getPrivateKey(userId);
-  if (!persisted) {
-    throw new Error('Failed to persist encryption keys in this browser');
-  }
-
+  await persistKeyPair(userId, newPrivate, publicKeyBase64, privateKeyPkcs8);
   await uploadPublicKey(publicKeyBase64);
-
-  if (password && privateKeyPkcs8) {
-    console.log('[E2EE] Creating encrypted private key backup...');
-    try {
-      const backup = await encryptPrivateKeyPkcs8WithPassword(privateKeyPkcs8, password);
-      await uploadEncryptedKeyBackup({
-        encryptedPrivateKey: backup.encryptedPrivateKey,
-        iv: backup.iv,
-        salt: backup.salt,
-      });
-      await saveEncryptedPrivateKeyBackup(userId, backup);
-    } catch (err) {
-      console.warn('[E2EE] Could not create encrypted backup:', err);
-    }
-  }
+  await storePasswordBackups(userId, privateKeyPkcs8, password, publicKeyBase64);
 
   return {
     status: 'SUCCESS',
     action: 'NEW_KEYS_GENERATED',
-    message: 'New encryption key pair generated and stored securely.',
+    message: 'New encryption key pair generated',
   };
 }
 
-/**
- * Recover keys from encrypted backup (manual modal or auto on login with password).
- */
 export async function recoverKeysFromBackup(userId, password, profileOverride = null) {
   if (!userId || !password) {
     throw new Error('userId and password required for backup recovery');
@@ -259,22 +309,14 @@ export async function recoverKeysFromBackup(userId, password, profileOverride = 
   const encryptedPrivateKey = userProfile?.encryptedPrivateKeyBackup;
   const iv = userProfile?.encryptedPrivateKeyIV;
   const salt = userProfile?.encryptedPrivateKeySalt;
+  const localBackup = getLocalEncryptedBackup(userId);
 
-  if (!encryptedPrivateKey || !iv || !salt) {
-    throw new Error('No encrypted backup found on server. Cannot recover keys.');
-  }
+  const backup = (encryptedPrivateKey && iv && salt)
+    ? { encryptedPrivateKey, iv, salt }
+    : localBackup;
 
-  let recoveredPrivateKey;
-  try {
-    recoveredPrivateKey = await decryptPrivateKeyWithPassword(
-      encryptedPrivateKey,
-      iv,
-      salt,
-      password
-    );
-  } catch (err) {
-    console.error('[E2EE] Decryption failed:', err);
-    throw new Error('Incorrect password or corrupted backup. Cannot recover keys.');
+  if (!backup?.encryptedPrivateKey || !backup?.iv || !backup?.salt) {
+    throw new Error('No encrypted backup found. Cannot recover keys.');
   }
 
   const publicKeyBase64 = userProfile?.publicKey;
@@ -282,47 +324,36 @@ export async function recoverKeysFromBackup(userId, password, profileOverride = 
     throw new Error('Public key not found in user profile');
   }
 
-  await savePrivateKey(userId, recoveredPrivateKey);
-  await savePublicKey(userId, publicKeyBase64);
-
-  const persisted = await getPrivateKey(userId);
-  if (!persisted) {
-    throw new Error('Failed to persist recovered keys in this browser');
-  }
-
-  console.log('[E2EE] Keys recovered and restored to IndexedDB.');
+  await restoreFromEncryptedBackup(userId, backup, password, publicKeyBase64);
+  console.log('[E2EE] Keys recovered successfully.');
   return {
     status: 'SUCCESS',
-    message: 'Encryption keys recovered and restored. Chat history is now accessible.',
+    message: 'Encryption keys recovered. Chat history is now accessible.',
   };
 }
 
 /**
- * Generate new keys when user explicitly skips recovery on a new device.
- * Old encrypted history will remain unreadable on this browser.
+ * Last resort: new keys for this browser. Only call when user explicitly confirms.
+ * Overwrites server public key — old encrypted messages become unreadable.
  */
-export async function generateFreshKeysAfterSkip(userId) {
+export async function generateFreshKeysAfterSkip(userId, password = null) {
   const existing = await getPrivateKey(userId);
   if (existing) {
     return { status: 'SUCCESS', action: 'KEYS_ALREADY_PRESENT' };
   }
 
-  const { publicKey, privateKey: newPrivate } = await generateKeyPair();
+  const { publicKey, privateKey: newPrivate, privateKeyPkcs8 } = await generateKeyPair();
   const publicKeyBase64 = await exportPublicKey(publicKey);
 
-  await savePrivateKey(userId, newPrivate);
-  await savePublicKey(userId, publicKeyBase64);
-
-  const persisted = await getPrivateKey(userId);
-  if (!persisted) {
-    throw new Error('Failed to persist encryption keys in this browser');
-  }
-
+  await persistKeyPair(userId, newPrivate, publicKeyBase64, privateKeyPkcs8);
   await uploadPublicKey(publicKeyBase64);
+  if (password) {
+    await storePasswordBackups(userId, privateKeyPkcs8, password, publicKeyBase64);
+  }
 
   return {
     status: 'SUCCESS',
     action: 'NEW_KEYS_AFTER_SKIP',
-    message: 'New encryption keys created. Previous messages from other devices cannot be decrypted here.',
+    message: 'New encryption keys created for this browser.',
   };
 }

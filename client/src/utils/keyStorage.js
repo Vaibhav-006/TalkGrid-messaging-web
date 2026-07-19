@@ -1,18 +1,15 @@
 /**
- * IndexedDB wrapper for non-exportable ECDH private keys.
- *
- * Why not localStorage?
- * - localStorage is synchronous and readable by any script on the page (XSS = full key theft).
- * - IndexedDB can persist CryptoKey objects (structured clone) so the private key never
- *   exists as extractable bytes in JS-accessible storage.
- *
- * Keys are stored under alias: priv_{userId}
+ * IndexedDB storage for E2EE keys.
+ * Stores PKCS8 bytes (reliable across browser restarts) plus optional CryptoKey cache.
  */
 
 const DB_NAME = 'talkgrid_e2ee_keys';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'privateKeys';
 const KEY_FLAG_PREFIX = 'talkgrid_e2ee_v1_';
+const LOCAL_BACKUP_PREFIX = 'talkgrid_e2ee_backup_';
+
+const ECDH_PARAMS = { name: 'ECDH', namedCurve: 'P-256' };
 
 function normalizeUserId(userId) {
   const n = Number(userId);
@@ -23,11 +20,15 @@ function keyFlagName(userId) {
   return `${KEY_FLAG_PREFIX}${normalizeUserId(userId)}`;
 }
 
+function localBackupName(userId) {
+  return `${LOCAL_BACKUP_PREFIX}${normalizeUserId(userId)}`;
+}
+
 export function markKeyStored(userId) {
   try {
     localStorage.setItem(keyFlagName(userId), '1');
   } catch {
-    // ignore quota / privacy mode
+    // ignore
   }
 }
 
@@ -36,6 +37,25 @@ export function hasKeyStoredFlag(userId) {
     return localStorage.getItem(keyFlagName(userId)) === '1';
   } catch {
     return false;
+  }
+}
+
+/** Password-encrypted PKCS8 backup in localStorage (survives IndexedDB CryptoKey issues). */
+export function saveLocalEncryptedBackup(userId, backup) {
+  try {
+    localStorage.setItem(localBackupName(userId), JSON.stringify(backup));
+    markKeyStored(userId);
+  } catch (err) {
+    console.warn('[E2EE] Could not save local encrypted backup:', err);
+  }
+}
+
+export function getLocalEncryptedBackup(userId) {
+  try {
+    const raw = localStorage.getItem(localBackupName(userId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -63,36 +83,58 @@ function publicStorageKey(userId) {
   return `pub_${normalizeUserId(userId)}`;
 }
 
+function toPkcs8Buffer(pkcs8Bytes) {
+  if (pkcs8Bytes instanceof ArrayBuffer) return pkcs8Bytes;
+  if (ArrayBuffer.isView(pkcs8Bytes)) {
+    return pkcs8Bytes.buffer.slice(
+      pkcs8Bytes.byteOffset,
+      pkcs8Bytes.byteOffset + pkcs8Bytes.byteLength
+    );
+  }
+  throw new Error('Invalid PKCS8 bytes');
+}
+
+async function importPrivateKeyFromPkcs8(pkcs8Bytes) {
+  return window.crypto.subtle.importKey(
+    'pkcs8',
+    toPkcs8Buffer(pkcs8Bytes),
+    ECDH_PARAMS,
+    false,
+    ['deriveKey']
+  );
+}
+
 /**
- * Persist the user's private CryptoKey under priv_{userId}.
+ * Persist private key. Prefer PKCS8 bytes — they survive browser restarts reliably.
  * @param {string|number} userId
  * @param {CryptoKey} privateKey
+ * @param {ArrayBuffer|Uint8Array} [pkcs8Bytes]
  */
-export async function savePrivateKey(userId, privateKey) {
+export async function savePrivateKey(userId, privateKey, pkcs8Bytes = null) {
   if (!userId || !privateKey) {
     throw new Error('savePrivateKey requires userId and privateKey');
   }
+
+  const payload = pkcs8Bytes
+    ? { v: 2, pkcs8: toPkcs8Buffer(pkcs8Bytes) }
+    : { v: 1, cryptoKey: privateKey };
+
   const db = await openDb();
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readwrite');
     tx.oncomplete = () => {
       db.close();
+      markKeyStored(userId);
       resolve();
     };
     tx.onerror = () => {
       db.close();
       reject(tx.error ?? new Error('IndexedDB write failed'));
     };
-    tx.objectStore(STORE_NAME).put(privateKey, storageKey(userId));
+    tx.objectStore(STORE_NAME).put(payload, storageKey(userId));
   });
-  markKeyStored(userId);
 }
 
-/**
- * Persist the user's exported SPKI public key (Base64) for server re-sync.
- * @param {string|number} userId
- * @param {string} publicKeyBase64
- */
 export async function savePublicKey(userId, publicKeyBase64) {
   if (!userId || !publicKeyBase64) {
     throw new Error('savePublicKey requires userId and publicKeyBase64');
@@ -112,11 +154,6 @@ export async function savePublicKey(userId, publicKeyBase64) {
   });
 }
 
-/**
- * Load stored public key Base64 for userId, or null.
- * @param {string|number} userId
- * @returns {Promise<string|null>}
- */
 export async function getPublicKey(userId) {
   if (!userId) return null;
   const db = await openDb();
@@ -134,15 +171,10 @@ export async function getPublicKey(userId) {
   });
 }
 
-/**
- * Load the private CryptoKey for userId, or null if none exists.
- * @param {string|number} userId
- * @returns {Promise<CryptoKey|null>}
- */
 export async function getPrivateKey(userId) {
   if (!userId) return null;
   const db = await openDb();
-  return new Promise((resolve, reject) => {
+  const record = await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, 'readonly');
     const request = tx.objectStore(STORE_NAME).get(storageKey(userId));
     request.onsuccess = () => {
@@ -154,15 +186,31 @@ export async function getPrivateKey(userId) {
       reject(request.error ?? new Error('IndexedDB read failed'));
     };
   });
+
+  if (!record) return null;
+
+  try {
+    if (record instanceof CryptoKey) {
+      return record;
+    }
+    if (record?.v === 2 && record?.pkcs8) {
+      return await importPrivateKeyFromPkcs8(record.pkcs8);
+    }
+    if (record?.v === 1 && record?.cryptoKey instanceof CryptoKey) {
+      return record.cryptoKey;
+    }
+  } catch (err) {
+    console.error('[E2EE] Failed to load private key from storage:', err);
+  }
+
+  return null;
 }
 
-/**
- * Remove stored private key (e.g. on logout or key rotation).
- */
 export async function deletePrivateKey(userId) {
   if (!userId) return;
   try {
     localStorage.removeItem(keyFlagName(userId));
+    localStorage.removeItem(localBackupName(userId));
   } catch {
     // ignore
   }
@@ -179,25 +227,14 @@ export async function deletePrivateKey(userId) {
     };
     tx.objectStore(STORE_NAME).delete(storageKey(userId));
     tx.objectStore(STORE_NAME).delete(publicStorageKey(userId));
-    tx.objectStore(STORE_NAME).delete(`backup_${String(userId)}`);
+    tx.objectStore(STORE_NAME).delete(`backup_${normalizeUserId(userId)}`);
   });
 }
 
-/**
- * ENHANCEMENT: Store encrypted private key backup locally for reference.
- * Format: { encryptedPrivateKey, iv, salt } all in Base64
- */
 function encryptedBackupKey(userId) {
-  return `backup_${String(userId)}`;
+  return `backup_${normalizeUserId(userId)}`;
 }
 
-/**
- * Save encrypted private key backup to IndexedDB (for caching).
- * The actual encrypted backup also lives on the backend.
- * 
- * @param {string|number} userId
- * @param {Object} backup - { encryptedPrivateKey, iv, salt } in Base64
- */
 export async function saveEncryptedPrivateKeyBackup(userId, backup) {
   if (!userId || !backup) {
     throw new Error('saveEncryptedPrivateKeyBackup requires userId and backup object');
@@ -217,12 +254,6 @@ export async function saveEncryptedPrivateKeyBackup(userId, backup) {
   });
 }
 
-/**
- * Retrieve encrypted private key backup from IndexedDB.
- * 
- * @param {string|number} userId
- * @returns {Promise<Object|null>} - { encryptedPrivateKey, iv, salt } or null
- */
 export async function getEncryptedPrivateKeyBackup(userId) {
   if (!userId) return null;
   const db = await openDb();
