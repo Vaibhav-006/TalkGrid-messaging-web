@@ -442,7 +442,7 @@ useEffect(() => {
     (async () => {
       const needsDecrypt = messages.some(
         (m) => (m.ciphertext || m.encrypted)
-          && m.content === '🔒 Encrypted message'
+          && (m.content === '🔒 Encrypted message' || m.content === '[Unable to decrypt message]')
       );
       if (!needsDecrypt) return;
       try {

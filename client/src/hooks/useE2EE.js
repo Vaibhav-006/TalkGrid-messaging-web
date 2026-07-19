@@ -1,18 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  generateKeyPair,
-  exportPublicKey,
   importPublicKey,
   deriveSharedKey,
   encryptMessage,
   decryptMessage,
-  verifyKeyPairMatches,
 } from '../utils/cryptoUtils';
-import { getPrivateKey, savePrivateKey, getPublicKey, savePublicKey, deletePrivateKey } from '../utils/keyStorage';
+import { getPrivateKey } from '../utils/keyStorage';
 import * as api from '../api';
 
 /**
  * E2EE helpers for 1-on-1 direct chats (used by Chat.jsx).
+ * Key generation happens once in authKeyHandler on login — this hook only loads existing keys.
  */
 export function useE2EE({ userId, peerId, peerPublicKey }) {
   const [keysReady, setKeysReady] = useState(false);
@@ -40,56 +38,29 @@ export function useE2EE({ userId, peerId, peerPublicKey }) {
     return sharedKey;
   }, [cacheKey]);
 
-  const regenerateAndUploadKeys = useCallback(async () => {
-    const { publicKey, privateKey: newPrivate } = await generateKeyPair();
-    const publicKeyBase64 = await exportPublicKey(publicKey);
-    await savePrivateKey(userId, newPrivate);
-    await savePublicKey(userId, publicKeyBase64);
-    privateKeyRef.current = newPrivate;
-    await api.uploadPublicKey(publicKeyBase64);
-    return publicKeyBase64;
-  }, [userId]);
-
-  const initializeKeys = useCallback(async () => {
+  const loadKeys = useCallback(async () => {
     if (!userId) return;
     setKeyError('');
     try {
-      let privateKey = await getPrivateKey(userId);
-      let cachedPublic = await getPublicKey(userId);
-
-      if (privateKey && !cachedPublic) {
-        await deletePrivateKey(userId);
-        privateKey = null;
-      }
-
-      if (privateKey && cachedPublic) {
-        const valid = await verifyKeyPairMatches(privateKey, cachedPublic);
-        if (!valid) {
-          await deletePrivateKey(userId);
-          privateKey = null;
-          cachedPublic = null;
-        }
-      }
-
+      const privateKey = await getPrivateKey(userId);
       if (!privateKey) {
-        cachedPublic = await regenerateAndUploadKeys();
-        privateKey = privateKeyRef.current;
-      } else {
-        privateKeyRef.current = privateKey;
-        await api.uploadPublicKey(cachedPublic);
+        privateKeyRef.current = null;
+        setKeysReady(false);
+        setKeyError('Encryption keys not found. Log out and sign in again.');
+        return;
       }
-
+      privateKeyRef.current = privateKey;
       setKeysReady(true);
     } catch (err) {
-      console.error('[E2EE] Key initialization failed:', err);
-      setKeyError(err?.message || 'Failed to initialize encryption keys');
+      console.error('[E2EE] Failed to load encryption keys:', err);
+      setKeyError(err?.message || 'Failed to load encryption keys');
       setKeysReady(false);
     }
-  }, [userId, regenerateAndUploadKeys]);
+  }, [userId]);
 
   useEffect(() => {
-    initializeKeys();
-  }, [initializeKeys]);
+    loadKeys();
+  }, [loadKeys]);
 
   useEffect(() => {
     sharedKeyCacheRef.current.clear();
@@ -155,11 +126,9 @@ export function useE2EE({ userId, peerId, peerPublicKey }) {
     keysReady,
     keyError,
     isDirectE2EEReady,
-    initializeKeys,
+    loadKeys,
     sendEncryptedMessage,
     decryptChatMessage,
     decryptMessageList,
   };
 }
-
-/** Standalone key setup — see utils/e2eeSetup.js (used by App.jsx on login). */

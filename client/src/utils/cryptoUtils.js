@@ -58,6 +58,8 @@ export async function generateKeyPair() {
   return {
     publicKey: tempPair.publicKey,
     privateKey,
+    /** PKCS8 bytes — only available at generation time for password backup. */
+    privateKeyPkcs8: pkcs8,
   };
 }
 
@@ -139,21 +141,9 @@ export async function decryptMessage(sharedKey, ciphertextBase64, ivBase64, { qu
  */
 export async function verifyKeyPairMatches(privateKey, publicKeyBase64) {
   try {
-    const theirPublicKey = await importPublicKey(publicKeyBase64);
-    const sharedKey = await deriveSharedKey(privateKey, theirPublicKey);
-    const iv = window.crypto.getRandomValues(new Uint8Array(IV_BYTE_LENGTH));
-    const encoded = new TextEncoder().encode('e2ee-key-check');
-    const ciphertextBuffer = await subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      sharedKey,
-      encoded
-    );
-    const decrypted = await subtle.decrypt(
-      { name: 'AES-GCM', iv },
-      sharedKey,
-      ciphertextBuffer
-    );
-    return new TextDecoder().decode(decrypted) === 'e2ee-key-check';
+    const importedPublic = await importPublicKey(publicKeyBase64);
+    await deriveSharedKey(privateKey, importedPublic);
+    return true;
   } catch {
     return false;
   }

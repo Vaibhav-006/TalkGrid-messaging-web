@@ -10,7 +10,7 @@ export default function Login({ onLogin, onSwitch, error, setError }) {
     setError('');
     try {
       const { user, token } = await api.login(username, password);
-      onLogin(user, token);
+      onLogin(user, token, password);
     } catch (err) {
       setError(err.message || 'Login failed');
     }

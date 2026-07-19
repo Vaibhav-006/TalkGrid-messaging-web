@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { connectSocket, disconnectSocket } from './socket';
 import * as api from './api';
 import Login from './Login';
 import Register from './Register';
 import Chat from './Chat';
-import { initializeUserKeys, recoverKeysFromBackup } from './utils/authKeyHandler';
+import { initializeUserKeys, recoverKeysFromBackup, generateFreshKeysAfterSkip } from './utils/authKeyHandler';
 
 const TOKEN_KEY = 'chat_token';
 const USER_KEY = 'chat_user';
@@ -63,19 +63,22 @@ function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
   const [authMode, setAuthMode] = useState('login');
   const [loading, setLoading] = useState(true);
+  const [e2eeReady, setE2eeReady] = useState(false);
   const [error, setError] = useState('');
   const [keyRecoveryModal, setKeyRecoveryModal] = useState(null);
+  const pendingPasswordRef = useRef(null);
 
   const initializeKeys = async (userId, password = null) => {
+    setE2eeReady(false);
     try {
       const result = await initializeUserKeys(userId, { password });
-      
+
       if (result.status === 'NEEDS_BACKUP_RESTORE') {
-        // Show recovery modal
         setKeyRecoveryModal(userId);
         return;
       }
 
+      setE2eeReady(true);
       console.log('[E2EE] Key initialization successful:', result);
     } catch (err) {
       console.error('[E2EE] Key initialization failed:', err);
@@ -85,55 +88,66 @@ function App() {
 
   const handleKeyRecoveryComplete = () => {
     setKeyRecoveryModal(null);
+    setE2eeReady(true);
   };
 
-  const handleKeyRecoverySkip = () => {
+  const handleKeyRecoverySkip = async () => {
+    if (keyRecoveryModal) {
+      try {
+        await generateFreshKeysAfterSkip(keyRecoveryModal);
+        setE2eeReady(true);
+      } catch (err) {
+        console.error('[E2EE] Failed to create new keys after skip:', err);
+      }
+    }
     setKeyRecoveryModal(null);
   };
 
   useEffect(() => {
     if (!token) {
       setUser(null);
+      setE2eeReady(false);
       setLoading(false);
       return;
     }
     connectSocket(token);
     api.getMe()
-      .then((u) => {
+      .then(async (u) => {
         setUser(u);
         localStorage.setItem(USER_KEY, JSON.stringify(u));
-        initializeKeys(u.id);
+        await initializeKeys(u.id, pendingPasswordRef.current);
+        pendingPasswordRef.current = null;
       })
       .catch((err) => {
         localStorage.removeItem(TOKEN_KEY);
         localStorage.removeItem(USER_KEY);
         setToken(null);
         setUser(null);
+        setE2eeReady(false);
         disconnectSocket();
         setError(err?.message || 'Session expired — please sign in again');
       })
       .finally(() => setLoading(false));
   }, [token]);
 
-  const handleLogin = (u, t) => {
+  const handleLogin = (u, t, password) => {
+    pendingPasswordRef.current = password || null;
     localStorage.setItem(TOKEN_KEY, t);
     localStorage.setItem(USER_KEY, JSON.stringify(u));
     setToken(t);
     setUser(u);
     setError('');
     connectSocket(t);
-    initializeKeys(u.id);
   };
 
   const handleRegister = (u, t, password) => {
+    pendingPasswordRef.current = password || null;
     localStorage.setItem(TOKEN_KEY, t);
     localStorage.setItem(USER_KEY, JSON.stringify(u));
     setToken(t);
     setUser(u);
     setError('');
     connectSocket(t);
-    // Pass password for encrypted backup creation during registration
-    initializeKeys(u.id, password);
   };
 
   const handleLogout = () => {
@@ -141,9 +155,11 @@ function App() {
     localStorage.removeItem(USER_KEY);
     setToken(null);
     setUser(null);
+    setE2eeReady(false);
     setError('');
     disconnectSocket();
     setKeyRecoveryModal(null);
+    pendingPasswordRef.current = null;
   };
 
   if (loading) {
@@ -190,6 +206,17 @@ function App() {
           console.error('[E2EE] Key recovery error:', err);
         }}
       />
+    );
+  }
+
+  if (user && !keyRecoveryModal && !e2eeReady) {
+    return (
+      <div className="auth-screen">
+        <div className="auth-loading">
+          <div className="loading-spinner" aria-hidden />
+          <p>Loading encryption keys…</p>
+        </div>
+      </div>
     );
   }
 
