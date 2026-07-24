@@ -264,4 +264,14 @@ export async function uploadEncryptedKeyBackup(backup) {
   return data;
 }
 
+export async function markConversationAsRead(id) {
+  const res = await fetchWithTimeout(`${API}/messages/conversation/${id}/read`, {
+    method: 'POST',
+    headers: headers(),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Failed to mark as read');
+  return data;
+}
+
 

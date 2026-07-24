@@ -127,6 +127,22 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('typing:start', async ({ conversationId }) => {
+    try {
+      const convId = parseInt(conversationId, 10);
+      if (!(await isConversationMember(convId, socket.userId))) return;
+      emitToConversationMembers(io, convId, 'typing:start', { conversationId: convId, userId: uid });
+    } catch (err) {}
+  });
+
+  socket.on('typing:stop', async ({ conversationId }) => {
+    try {
+      const convId = parseInt(conversationId, 10);
+      if (!(await isConversationMember(convId, socket.userId))) return;
+      emitToConversationMembers(io, convId, 'typing:stop', { conversationId: convId, userId: uid });
+    } catch (err) {}
+  });
+
   socket.on('disconnect', () => {
     const c = (presenceCounts.get(uid) || 1) - 1;
     if (c <= 0) {

@@ -9,6 +9,7 @@ const messageSchema = new mongoose.Schema(
     content: { type: String, default: null },
     ciphertext: { type: String, default: null },
     iv: { type: String, default: null },
+    status: { type: String, enum: ['sent', 'delivered', 'seen'], default: 'sent' },
   },
   { timestamps: true }
 );
@@ -30,6 +31,7 @@ function formatMessage(doc, sender = null) {
     ciphertext,
     iv: doc.iv ?? null,
     encrypted: !!ciphertext,
+    status: doc.status || 'sent',
     created_at: doc.createdAt,
     sender,
   };

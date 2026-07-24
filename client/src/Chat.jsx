@@ -48,7 +48,10 @@ const [selectedStatuses, setSelectedStatuses] = useState(null);
   const [peerPublicKey, setPeerPublicKey] = useState(null);
   const [peerKeyError, setPeerKeyError] = useState('');
   const [sendError, setSendError] = useState('');
+  const [typingUsers, setTypingUsers] = useState({});
+  const typingTimeoutRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const chatMessagesRef = useRef(null);
   const textareaRef = useRef(null);
   const chatMenuRef = useRef(null);
 
@@ -179,8 +182,33 @@ useEffect(() => {
   }, [selectedId]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (!chatMessagesRef.current || !messagesEndRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = chatMessagesRef.current;
+    const isNearBottom = scrollHeight - scrollTop - clientHeight < 150;
+    
+    // Auto-scroll if we're already near the bottom (reading latest)
+    // or if it's the initial load.
+    if (isNearBottom || messages.length <= 1) {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
   }, [messages]);
+
+  useEffect(() => {
+    if (!loading && selectedId) {
+      setTimeout(() => {
+        messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+      }, 50);
+    }
+  }, [loading, selectedId]);
+
+  useEffect(() => {
+    if (selectedId && messages.length > 0) {
+      const unreadFromOthers = messages.some(m => Number(m.sender_id) !== Number(user.id) && m.status !== 'seen');
+      if (unreadFromOthers) {
+        api.markConversationAsRead(selectedId).catch(() => {});
+      }
+    }
+  }, [selectedId, messages, user.id]);
 
   useEffect(() => {
     const socket = getSocket();
@@ -251,6 +279,33 @@ useEffect(() => {
     const onConversationDeleted = ({ conversationId }) => {
       onGroupRemoved({ conversationId });
     };
+    const onTypingStart = ({ conversationId, userId }) => {
+      if (Number(userId) === Number(user.id)) return;
+      setTypingUsers((prev) => {
+        const current = prev[conversationId] || [];
+        if (current.includes(userId)) return prev;
+        return { ...prev, [conversationId]: [...current, userId] };
+      });
+    };
+    const onTypingStop = ({ conversationId, userId }) => {
+      setTypingUsers((prev) => {
+        const current = prev[conversationId] || [];
+        const next = current.filter((id) => Number(id) !== Number(userId));
+        if (current.length === next.length) return prev;
+        return { ...prev, [conversationId]: next };
+      });
+    };
+    const onStatusUpdate = ({ conversationId, readerId, status }) => {
+      if (Number(readerId) === Number(user.id)) return;
+      if (conversationId === selectedId) {
+        setMessages((prev) => prev.map(m => {
+          if (Number(m.sender_id) === Number(user.id) && m.status !== 'seen') {
+            return { ...m, status: 'seen' };
+          }
+          return m;
+        }));
+      }
+    };
     socket.on('message:new', onNewMessage);
     socket.on('conversation:new', onNewConversation);
     socket.on('message:deleted', onDeletedMessage);
@@ -258,6 +313,9 @@ useEffect(() => {
     socket.on('group:removed', onGroupRemoved);
     socket.on('group:deleted', onGroupDeleted);
     socket.on('conversation:deleted', onConversationDeleted);
+    socket.on('typing:start', onTypingStart);
+    socket.on('typing:stop', onTypingStop);
+    socket.on('messages:status_update', onStatusUpdate);
     return () => {
       socket.off('message:new', onNewMessage);
       socket.off('conversation:new', onNewConversation);
@@ -266,8 +324,11 @@ useEffect(() => {
       socket.off('group:removed', onGroupRemoved);
       socket.off('group:deleted', onGroupDeleted);
       socket.off('conversation:deleted', onConversationDeleted);
+      socket.off('typing:start', onTypingStart);
+      socket.off('typing:stop', onTypingStop);
+      socket.off('messages:status_update', onStatusUpdate);
     };
-  }, [selectedId, loadConversations, isMobile]);
+  }, [selectedId, loadConversations, isMobile, user.id]);
 
   const handleDeleteMessage = async (rawId) => {
     const id = normalizeId(rawId);
@@ -526,6 +587,12 @@ useEffect(() => {
     setSendError('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
 
+    const sock = getSocket();
+    if (sock && selectedId) {
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      sock.emit('typing:stop', { conversationId: selectedId });
+    }
+
     const useE2EEPath = !isGroup && isDirectE2EEReady;
 
     try {
@@ -549,6 +616,7 @@ useEffect(() => {
             created_at: sent.created_at ?? sent.createdAt ?? new Date().toISOString(),
           }];
         });
+        setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
         loadConversations();
       } else {
         if (!isGroup && !isDirectE2EEReady) {
@@ -559,6 +627,7 @@ useEffect(() => {
           return;
         }
         await api.sendMessage(selectedId, content);
+        setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
       }
     } catch (err) {
       console.error(err);
@@ -696,6 +765,21 @@ useEffect(() => {
       : isMobile
         ? 'app-layout app-layout--mobile'
         : 'app-layout';
+
+  const typingUserIds = selectedId ? typingUsers[selectedId] || [] : [];
+  const isTyping = typingUserIds.length > 0;
+  let typingLabel = '';
+  if (isTyping) {
+    if (isGroup) {
+      const names = typingUserIds.map((tid) => {
+        const m = currentConv?.members?.find((x) => Number(x.id) === Number(tid));
+        return m ? m.display_name || m.username : 'Someone';
+      });
+      typingLabel = names.length > 1 ? `${names.length} people are typing...` : `${names[0]} is typing...`;
+    } else {
+      typingLabel = 'typing...';
+    }
+  }
 
   return (
     <div className={layoutClass}>
@@ -919,11 +1003,15 @@ useEffect(() => {
               <div className="chat-header-main">
                 <h2 className="name">{convTitle(currentConv)}</h2>
                 <p className={`chat-header-presence ${!isGroup && isUserOnline(other?.id) ? 'chat-header-presence--online' : ''}`}>
-                  {isGroup
-                    ? `${memberCount} members`
-                    : isDirectE2EEReady
-                      ? (isUserOnline(other?.id) ? 'Online · End-to-end encrypted' : 'Offline · End-to-end encrypted')
-                      : (isUserOnline(other?.id) ? 'Online' : 'Offline')}
+                  {isTyping ? (
+                    <span className="typing-indicator">{typingLabel}</span>
+                  ) : (
+                    isGroup
+                      ? `${memberCount} members`
+                      : isDirectE2EEReady
+                        ? (isUserOnline(other?.id) ? 'Online · End-to-end encrypted' : 'Offline · End-to-end encrypted')
+                        : (isUserOnline(other?.id) ? 'Online' : 'Offline')
+                  )}
                 </p>
               </div>
               {!isGroup && (
@@ -1066,7 +1154,7 @@ useEffect(() => {
                 </div>
               </div>
             )}
-            <div className="chat-messages">
+            <div className="chat-messages" ref={chatMessagesRef}>
               {loading ? (
                 <div key="loading" className="chat-loading">
                   <div className="loading-spinner" aria-hidden />
@@ -1102,6 +1190,20 @@ useEffect(() => {
                           {createdDate
                             ? createdDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                             : ''}
+                          {isMe && (
+                            <span style={{ marginLeft: '4px', verticalAlign: 'middle', display: 'inline-flex', alignItems: 'center' }}>
+                              {msg.status === 'seen' ? (
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="var(--primary, #10b981)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M18 6 7 17l-5-5"/>
+                                  <path d="M22 10l-7.5 7.5L13 16"/>
+                                </svg>
+                              ) : (
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ opacity: 0.6 }}>
+                                  <path d="M20 6 9 17l-5-5"/>
+                                </svg>
+                              )}
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -1122,6 +1224,15 @@ useEffect(() => {
                 const t = e.target;
                 t.style.height = 'auto';
                 t.style.height = `${Math.min(t.scrollHeight, 120)}px`;
+                
+                const sock = getSocket();
+                if (sock && selectedId) {
+                  sock.emit('typing:start', { conversationId: selectedId });
+                  if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+                  typingTimeoutRef.current = setTimeout(() => {
+                    sock.emit('typing:stop', { conversationId: selectedId });
+                  }, 2000);
+                }
               }}
               placeholder={
                 selectedId

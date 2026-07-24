@@ -129,6 +129,33 @@ function createRouter(io) {
     }
   });
 
+  router.post('/conversation/:conversationId/read', async (req, res) => {
+    try {
+      await ensureMongoConnected();
+      const convId = parseInt(req.params.conversationId, 10);
+      const readerId = Number(req.user.id);
+      if (Number.isNaN(convId) || Number.isNaN(readerId)) {
+        return res.status(400).json({ error: 'Invalid ID' });
+      }
+
+      await Message.updateMany(
+        { conversationSqlId: convId, senderSqlId: { $ne: readerId }, status: { $ne: 'seen' } },
+        { $set: { status: 'seen' } }
+      );
+
+      emitToConversationMembers(io, convId, 'messages:status_update', {
+        conversationId: convId,
+        readerId,
+        status: 'seen'
+      });
+
+      res.status(200).json({ success: true });
+    } catch (err) {
+      console.error('Read receipt error:', err);
+      res.status(500).json({ error: 'Failed to update read status' });
+    }
+  });
+
   return router;
 }
 
